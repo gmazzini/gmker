@@ -7,7 +7,7 @@
 #include "limine.h"
 #include "gmabi.h"
 
-#define GM_VERSION "3.0"
+#define GM_VERSION "3.1"
 #define GM_TICK_HZ 100U
 #define GM_PAGE_SIZE 4096ULL
 #define GM_NET_MTU 1500U
@@ -116,6 +116,8 @@ int gm_net_prepare(const uint8_t dst[4],uint64_t timeout);
 int gm_ipv4_send(const uint8_t dst[4],uint8_t protocol,const uint8_t *data,uint16_t len);
 uint16_t gm_checksum(const void *data,uint16_t len);
 int gm_ping(const uint8_t dst[4],uint64_t timeout);
+uint16_t gm_udp_exchange(const uint8_t dst[4],uint16_t port,const uint8_t *tx,uint16_t tx_len,
+                         uint8_t *rx,uint16_t rx_max,uint64_t timeout);
 void gm_ipv4_input(const uint8_t src[4],uint8_t protocol,const uint8_t *data,uint16_t len);
 
 void gm_tcp_init(void);

@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.09
+// Gianluca Mazzini @2026- Version 2.10
 #include "gmker.h"
 
 
@@ -40,7 +40,7 @@ struct gm_service_frame {
 #define GM_APP_RUNNING 2U
 #define GM_APP_BLOCKED 3U
 #define GM_RESOURCE_NONE 0U
-#define GM_RESOURCE_COUNT 1U
+#define GM_RESOURCE_COUNT 2U
 #define GM_RESOURCE_BUCKETS 60U
 #define GM_RESOURCE_BUCKET_TICKS (10ULL*GM_TICK_HZ)
 #define GM_RESOURCE_WINDOW_TICKS (GM_RESOURCE_BUCKETS*GM_RESOURCE_BUCKET_TICKS)
@@ -86,7 +86,7 @@ static uint32_t gm_program_slot(const struct gm_app_slot *app) {
 }
 
 static struct gm_resource *gm_resource_get(uint32_t resource) {
-  if (resource!=GM_RESOURCE_TCP) return 0;
+  if (!resource || resource>GM_RESOURCE_COUNT) return 0;
   return &gm_resources[resource-1U];
 }
 
@@ -225,6 +225,7 @@ static const char *gm_app_state_name(uint32_t state) {
 
 static const char *gm_resource_name(uint32_t resource) {
   if (resource==GM_RESOURCE_TCP) return "tcp";
+  if (resource==GM_RESOURCE_UDP) return "udp";
   return "-";
 }
 
@@ -276,20 +277,20 @@ void gm_programs_status(void) {
   }
 }
 
-void gm_resources_status(void) {
+static void gm_resource_status(uint32_t resource_id,uint64_t now) {
   struct gm_resource *resource;
-  uint64_t now;
   uint64_t live;
   uint64_t total;
   uint64_t longest;
 
-  resource=&gm_resources[GM_RESOURCE_TCP-1U];
-  now=gm_ticks();
+  resource=gm_resource_get(resource_id);
+  if (!resource) return;
   live=gm_resource_live(resource,now);
   total=resource->total_ticks+live;
   longest=resource->max_hold;
   if (live>longest) longest=live;
-  gm_write("tcp owner=");
+  gm_write(gm_resource_name(resource_id));
+  gm_write(" owner=");
   if (resource->owner) {
     gm_write("app");
     gm_print_u64(resource->owner-1U);
@@ -307,6 +308,14 @@ void gm_resources_status(void) {
   gm_write(" recent10m=");
   gm_print_u64(gm_resource_recent(resource,now));
   gm_write(" ticks\n");
+}
+
+void gm_resources_status(void) {
+  uint64_t now;
+  uint32_t i;
+
+  now=gm_ticks();
+  for (i=1U;i<=GM_RESOURCE_COUNT;i++) gm_resource_status(i,now);
 }
 
 static uint32_t gm_u32(const uint8_t *p) {
@@ -654,6 +663,16 @@ int gm_program_service(void *raw) {
   if (frame->rax==GM_SVC_PING) {
     if (!gm_user_range(frame->rdi,4)) frame->rax=0;
     else frame->rax=gm_ping((const uint8_t *)frame->rdi,frame->rsi>500U?500U:frame->rsi);
+    return gm_program_yield(frame);
+  }
+  if (frame->rax==GM_SVC_UDP_EXCHANGE) {
+    if (!gm_resource_owned(gm_program_current,GM_RESOURCE_UDP) || !frame->rsi || frame->rsi>65535U ||
+        frame->rcx>GM_UDP_MAX || frame->r9>GM_UDP_MAX || !gm_user_range(frame->rdi,4) ||
+        (frame->rcx && !gm_user_range(frame->rdx,frame->rcx)) ||
+        (frame->r9 && !gm_user_range(frame->r8,frame->r9))) frame->rax=0;
+    else frame->rax=gm_udp_exchange((const uint8_t *)frame->rdi,(uint16_t)frame->rsi,
+                                    (const uint8_t *)frame->rdx,(uint16_t)frame->rcx,
+                                    (uint8_t *)frame->r8,(uint16_t)frame->r9,300U);
     return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_RESOURCE_ACQUIRE) {

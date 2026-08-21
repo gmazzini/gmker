@@ -1,4 +1,4 @@
-# gmker 3.0
+# gmker 3.1
 
 gmker is a small x86_64 operating environment designed to remain understandable as a whole.
 
@@ -131,11 +131,11 @@ When an application returns, faults or times out, only that slot terminates. The
 
 ## Exclusive resource ownership
 
-gmker has a fixed kernel resource manager for application-facing resources that cannot be used concurrently. The first named exclusive resource is `GM_RESOURCE_TCP`. Resource ownership is distinct from kernel control: the kernel always retains transport maintenance and control-plane use, including timers, RX, retransmission, loader operations and serial-shell GMSTORE commands, even while an application owns application-facing TCP use. Ownership is therefore exclusive between applications, not a lock against the kernel itself.
+gmker has a fixed kernel resource manager for application-facing resources that cannot be used concurrently. The implemented named resources are `GM_RESOURCE_TCP` and `GM_RESOURCE_UDP`. Resource ownership is distinct from kernel control: the kernel always retains transport maintenance and control-plane use, including timers, RX, retransmission, loader operations and serial-shell GMSTORE commands, even while an application owns an application-facing network resource. Ownership is therefore exclusive between applications, not a lock against the kernel itself.
 
 Applications use two ABI services through `gm_resource_acquire()` and `gm_resource_release()`. An acquire on a free resource assigns ownership immediately. An acquire on a busy resource saves the caller context, moves that slot to BLOCKED and enqueues it in a fixed FIFO of at most four application slots; there is no busy waiting. Release transfers ownership directly to the oldest waiter and changes that slot to READY.
 
-Application GMSTORE services (`STORE_READ`, `STORE_WRITE` and `STORE_APPEND`) require the caller to own `GM_RESOURCE_TCP`. A call without ownership fails without touching the transport. Ownership remains with the application across service calls until explicit release, allowing a short related transaction sequence to remain exclusive. The intended programming discipline is acquire immediately before the related TCP/GMSTORE work and release immediately afterward. Kernel GMSTORE operations do not consume or steal the application owner.
+Application GMSTORE services (`STORE_READ`, `STORE_WRITE` and `STORE_APPEND`) require the caller to own `GM_RESOURCE_TCP`. The one-shot UDP service requires `GM_RESOURCE_UDP`. Calls without the required ownership fail without touching the transport. Ownership remains with the application across service calls until explicit release. The intended programming discipline is acquire immediately before related network work and release immediately afterward. Kernel GMSTORE operations do not consume or steal the application owner.
 
 An application may own at most one exclusive resource at a time. A second acquire while it already owns or waits for a resource fails. This deliberately prevents circular application lock dependency instead of providing general mutex/semaphore primitives. Applications are expected to acquire as late as practical, use the resource for the shortest interval and release immediately.
 
@@ -143,7 +143,7 @@ All implemented application termination paths reclaim ownership automatically: n
 
 Each exclusive resource maintains bounded accounting: current owner and acquisition tick, FIFO waiters, acquisition count, completed total holding ticks, longest completed hold and 60 rolling ten-second buckets covering the most recent ten minutes. The `resources` shell command combines completed accounting with a current live hold, so `held`, `total`, `max` and `recent10m` remain meaningful while the resource is still owned. No accounting structure grows dynamically.
 
-The `apps` shell command shows all four slots with state, observed ring-3 CPU timer ticks, owned resource and awaited resource. The tick field is application CPU execution accounting, not wall-clock age. The `resources` command shows the TCP owner, current hold, waiter count, acquisition count, total holding ticks since boot, longest hold and rolling ten-minute usage.
+The `apps` shell command shows all four slots with state, observed ring-3 CPU timer ticks, owned resource and awaited resource. The tick field is application CPU execution accounting, not wall-clock age. The `resources` command reports both TCP and UDP ownership, current hold, waiter count, acquisition count, total holding ticks since boot, longest hold and rolling ten-minute usage.
 
 No administrative `abort` command is implemented. This is deliberate: an application cannot retain a resource indefinitely under the current model because every slot has a bounded execution deadline and timeout already follows the normal automatic resource-reclaim path. A separate abort mechanism would duplicate recovery behavior without a demonstrated need.
 
@@ -219,6 +219,20 @@ A static address can be selected at boot:
 ```text
 gmker.net=10.10.0.11/24,10.10.0.1
 ```
+
+## UDP model
+
+gmker 3.1 adds the smallest UDP mechanism required by a concrete gmapp: one bounded client exchange. It is not a socket subsystem. There is no bind API, listener, server endpoint table, raw IPv4 access or persistent application UDP endpoint.
+
+`gm_udp_exchange()` sends one datagram to an explicit IPv4 address and destination port from a temporary source port in the dynamic range, then waits for one matching reply from that exact peer. The kernel validates the UDP length and checksum, bounds payloads to `GM_UDP_MAX` (1024 bytes), and times out the exchange. Only one UDP exchange can be active because application access is serialized by `GM_RESOURCE_UDP`.
+
+The first real user is `gmapps/ntp.c`. NTP remains entirely application-level: the kernel knows only UDP. The application is invoked with an explicit server address:
+
+```text
+run ntp 129.6.15.28
+```
+
+It sends a 48-byte NTP client request to UDP port 123, validates the basic server reply, converts the transmit timestamp to Unix time and prints UTC. No DNS server or NTP server is hardcoded in the kernel.
 
 ## TCP model
 
@@ -413,13 +427,14 @@ The current contract is GM API version 2:
 9   exclusive resource acquire
 10  exclusive resource release
 11  GMSTORE stat
+12  one-shot UDP exchange
 ```
 
 GM API version 2 is an intentional semantic break from version 1. Services 6-8 retain their numbers, but application GMSTORE access now requires explicit `GM_RESOURCE_TCP` ownership; executing an API-1 image with API-2 semantics would therefore be incorrect. The loader rejects API-1 GM01 images rather than carrying a compatibility path or two application execution models.
 
 `STORE_STAT` was added because a real gmapp (`storecat`) needs to distinguish an empty object or EOF from read failure. It returns success separately and writes the 64-bit object size through a validated user pointer. `STORE_READ` keeps its compact byte-count-or-zero behavior and is not changed merely to make the interface more general.
 
-Every pointer supplied by a program is range-checked before the kernel dereferences it. GMSTORE read/write services accept at most one 1024-byte block per call; programs can loop when they need larger objects. Application GMSTORE services require TCP ownership, while kernel control-plane GMSTORE operations remain independent of application ownership.
+Every pointer supplied by a program is range-checked before the kernel dereferences it. GMSTORE read/write services accept at most one 1024-byte block per call; programs can loop when they need larger objects. Application GMSTORE services require TCP ownership, while the UDP exchange requires UDP ownership. Kernel control-plane GMSTORE operations remain independent of application ownership. Service 12 is an additive API-2 extension, so existing API-2 gmapps remain valid.
 
 The ABI deliberately has no general IPC, shared-memory synchronization, mutex or semaphore service. Application isolation plus kernel resource ownership remains the complete inter-application coordination model.
 
@@ -497,9 +512,10 @@ The maintained application examples currently are:
 
 ```text
 gmapps/primes100.c   compute and print the first 100 prime numbers
-gmapps/diag.c        exercise the complete current application ABI, including TCP ownership
+gmapps/diag.c        exercise core/store services including TCP ownership
 gmapps/storecat.c    acquire TCP, print a GMSTORE text object, then release TCP
 gmapps/netping.c     parse an IPv4 argument and ping it
+gmapps/ntp.c         acquire UDP and read UTC from an explicit NTP server IPv4 address
 ```
 
 Build outputs are deployed below `store/programs/x86_64/`. Example invocations are:
@@ -509,6 +525,7 @@ run primes100
 run diag hello
 run storecat /diag.txt
 run netping 10.0.2.2
+run ntp 129.6.15.28
 ```
 
 ## Serial shell
@@ -559,7 +576,7 @@ The maintained kernel implementation is flat. Application sources are the only m
 - `kernel.c` - boot configuration, initialization and main event loop;
 - `core.c` - runtime, serial, memory, page mapping, GDT/TSS, IDT/PIC/PIT;
 - `virtio.c` - modern VirtIO-net PCI transport, split virtqueues and DMA buffers;
-- `net.c` - Ethernet, ARP, IPv4 and ICMP;
+- `net.c` - Ethernet, ARP, IPv4, ICMP and bounded one-shot UDP;
 - `tcpstore.c` - one TCP client and GMSTORE client;
 - `programs.c` - GM01 loader, ring-3 runtime and service dispatch;
 - `shell.c` - serial command interpreter;
@@ -668,6 +685,9 @@ The test is bounded and self-cleaning. It validates:
 - recoverable invalid-opcode fault;
 - recoverable guard-page page fault;
 - explicit TCP ownership for application GMSTORE services;
+- rejection of UDP exchange without UDP ownership;
+- bounded UDP one-shot request/reply through QEMU user-network NAT;
+- independent UDP resource accounting as the second named exclusive resource;
 - rejection of application GMSTORE access without TCP ownership;
 - FIFO TCP ownership contention between two applications;
 - automatic resource reclaim after application return, fault and timeout;
@@ -685,16 +705,16 @@ The test is bounded and self-cleaning. It validates:
 A successful run ends with:
 
 ```text
-===== OK GMKER 3.0 CONSOLIDATION TEST =====
+===== OK GMKER 3.1 CONSOLIDATION TEST =====
 ```
 
 The final clean-build x86_64 kernel image reports:
 
 ```text
-text   36492
+text   38380
 data     224
-bss    37008
-total  73724 bytes
+bss    38352
+total  76956 bytes
 ```
 
-This is the consolidation baseline for gmker 3.0 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.
+This is the consolidation baseline for gmker 3.1 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.

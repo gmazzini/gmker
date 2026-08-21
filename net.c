@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.02
+// Gianluca Mazzini @2026- Version 2.03
 #include "gmker.h"
 
 #define GM_ETH_ARP 0x0806
@@ -6,6 +6,9 @@
 #define GM_ARP_MAX 8
 #define GM_PROTO_ICMP 1
 #define GM_PROTO_TCP 6
+#define GM_PROTO_UDP 17
+#define GM_UDP_PORT_FIRST 49152U
+#define GM_UDP_PORT_LAST 65535U
 
 struct gm_arp_packet {
   uint16_t htype;
@@ -32,6 +35,13 @@ struct gm_ipv4_header {
   uint8_t dst[4];
 } __attribute__((packed));
 
+struct gm_udp_header {
+  uint16_t src;
+  uint16_t dst;
+  uint16_t len;
+  uint16_t checksum;
+} __attribute__((packed));
+
 struct gm_arp_entry {
   uint8_t used;
   uint8_t ip[4];
@@ -43,6 +53,13 @@ static struct gm_arp_entry gm_arp[GM_ARP_MAX];
 static uint16_t gm_ip_id;
 static uint16_t gm_ping_seq;
 static volatile uint16_t gm_ping_reply;
+static uint8_t gm_udp_peer[4];
+static uint8_t gm_udp_reply[GM_UDP_MAX];
+static uint16_t gm_udp_local_port;
+static uint16_t gm_udp_remote_port;
+static uint16_t gm_udp_next_port;
+static volatile uint16_t gm_udp_reply_len;
+static volatile int gm_udp_active;
 static uint64_t gm_rx_packets;
 static uint64_t gm_tx_packets;
 static int gm_net_online;
@@ -171,6 +188,27 @@ uint16_t gm_checksum(const void *data,uint16_t len) {
   return (uint16_t)~sum;
 }
 
+static uint32_t gm_sum_add(uint32_t sum,const uint8_t *data,uint16_t len) {
+  for (;len>1U;len-=2U,data+=2) sum+=((uint16_t)data[0]<<8)|data[1];
+  if (len) sum+=(uint16_t)data[0]<<8;
+  return sum;
+}
+
+static uint16_t gm_udp_checksum(const uint8_t src[4],const uint8_t dst[4],const uint8_t *data,uint16_t len) {
+  uint32_t sum;
+  uint16_t value;
+
+  sum=0;
+  sum=gm_sum_add(sum,src,4U);
+  sum=gm_sum_add(sum,dst,4U);
+  sum+=GM_PROTO_UDP;
+  sum+=len;
+  sum=gm_sum_add(sum,data,len);
+  for (;sum>>16;) sum=(sum&0xffffU)+(sum>>16);
+  value=(uint16_t)~sum;
+  return value;
+}
+
 int gm_net_prepare(const uint8_t dst[4],uint64_t timeout) {
   uint8_t hop[4];
   uint8_t mac[6];
@@ -218,6 +256,24 @@ int gm_ipv4_send(const uint8_t dst[4],uint8_t protocol,const uint8_t *data,uint1
   return gm_eth_send(mac,GM_ETH_IPV4,packet,(uint16_t)(sizeof(*hdr)+len));
 }
 
+static void gm_udp_input(const uint8_t src[4],const uint8_t *data,uint16_t len) {
+  const struct gm_udp_header *hdr;
+  uint16_t udp_len;
+  uint16_t payload_len;
+
+  if (!gm_udp_active || len<sizeof(struct gm_udp_header)) return;
+  hdr=(const struct gm_udp_header *)data;
+  udp_len=gm_swap16(hdr->len);
+  if (udp_len<sizeof(*hdr) || udp_len>len) return;
+  if (!gm_ip_eq(src,gm_udp_peer) || gm_swap16(hdr->src)!=gm_udp_remote_port ||
+      gm_swap16(hdr->dst)!=gm_udp_local_port) return;
+  if (hdr->checksum && gm_udp_checksum(src,gm_config.ip,data,udp_len)!=0) return;
+  payload_len=(uint16_t)(udp_len-sizeof(*hdr));
+  if (!payload_len || payload_len>GM_UDP_MAX) return;
+  gm_memcpy(gm_udp_reply,data+sizeof(*hdr),payload_len);
+  gm_udp_reply_len=payload_len;
+}
+
 static void gm_icmp_input(const uint8_t src[4],const uint8_t *data,uint16_t len) {
   uint8_t reply[GM_NET_MTU];
   uint16_t sum;
@@ -241,6 +297,7 @@ static void gm_icmp_input(const uint8_t src[4],const uint8_t *data,uint16_t len)
 void gm_ipv4_input(const uint8_t src[4],uint8_t protocol,const uint8_t *data,uint16_t len) {
   if (protocol==GM_PROTO_ICMP) gm_icmp_input(src,data,len);
   else if (protocol==GM_PROTO_TCP) gm_tcp_input(src,data,len);
+  else if (protocol==GM_PROTO_UDP) gm_udp_input(src,data,len);
 }
 
 static void gm_ipv4_packet(const uint8_t *data,uint16_t len) {
@@ -290,6 +347,47 @@ void gm_net_poll(void) {
   }
 }
 
+uint16_t gm_udp_exchange(const uint8_t dst[4],uint16_t port,const uint8_t *tx,uint16_t tx_len,
+                         uint8_t *rx,uint16_t rx_max,uint64_t timeout) {
+  uint8_t packet[sizeof(struct gm_udp_header)+GM_UDP_MAX];
+  struct gm_udp_header *hdr;
+  uint16_t udp_len;
+  uint16_t reply_len;
+  uint16_t checksum;
+  uint64_t start;
+
+  if (!port || tx_len>GM_UDP_MAX || rx_max>GM_UDP_MAX || (!tx && tx_len) || (!rx && rx_max) || !timeout) return 0;
+  if (gm_udp_active || !gm_net_prepare(dst,timeout)) return 0;
+  gm_udp_local_port=gm_udp_next_port;
+  if (gm_udp_next_port>=GM_UDP_PORT_LAST) gm_udp_next_port=GM_UDP_PORT_FIRST;
+  else gm_udp_next_port++;
+  gm_udp_remote_port=port;
+  gm_copy_ip(gm_udp_peer,dst);
+  gm_udp_reply_len=0;
+  gm_udp_active=1;
+  hdr=(struct gm_udp_header *)packet;
+  udp_len=(uint16_t)(sizeof(*hdr)+tx_len);
+  hdr->src=gm_swap16(gm_udp_local_port);
+  hdr->dst=gm_swap16(port);
+  hdr->len=gm_swap16(udp_len);
+  hdr->checksum=0;
+  if (tx_len) gm_memcpy(packet+sizeof(*hdr),tx,tx_len);
+  checksum=gm_udp_checksum(gm_config.ip,dst,packet,udp_len);
+  hdr->checksum=gm_swap16(checksum?checksum:0xffffU);
+  if (!gm_ipv4_send(dst,GM_PROTO_UDP,packet,udp_len)) {
+    gm_udp_active=0;
+    return 0;
+  }
+  start=gm_ticks();
+  for (;gm_ticks()-start<timeout && !gm_udp_reply_len;) gm_pump();
+  reply_len=gm_udp_reply_len;
+  gm_udp_active=0;
+  gm_udp_reply_len=0;
+  if (!reply_len || reply_len>rx_max) return 0;
+  gm_memcpy(rx,gm_udp_reply,reply_len);
+  return reply_len;
+}
+
 int gm_ping(const uint8_t dst[4],uint64_t timeout) {
   uint8_t packet[24];
   uint16_t sum;
@@ -304,7 +402,7 @@ int gm_ping(const uint8_t dst[4],uint64_t timeout) {
   gm_ping_seq++;
   packet[6]=(uint8_t)(gm_ping_seq>>8);
   packet[7]=(uint8_t)gm_ping_seq;
-  gm_memcpy(packet+8,"gmker 3.0 ping",14);
+  gm_memcpy(packet+8,"gmker 3.1 ping",14);
   sum=gm_checksum(packet,sizeof(packet));
   packet[2]=(uint8_t)(sum>>8);
   packet[3]=(uint8_t)sum;
@@ -323,6 +421,13 @@ void gm_net_init(void) {
   gm_ip_id=0;
   gm_ping_seq=0;
   gm_ping_reply=0;
+  gm_udp_local_port=0;
+  gm_udp_remote_port=0;
+  gm_udp_next_port=GM_UDP_PORT_FIRST;
+  gm_udp_reply_len=0;
+  gm_udp_active=0;
+  gm_memset(gm_udp_peer,0,sizeof(gm_udp_peer));
+  gm_memset(gm_udp_reply,0,sizeof(gm_udp_reply));
   gm_rx_packets=0;
   gm_tx_packets=0;
   gm_net_online=0;
