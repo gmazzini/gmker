@@ -35,7 +35,7 @@ cleanup() {
   if [ -n "$UDP_PID" ]; then kill "$UDP_PID" 2>/dev/null || true; fi
   exec 3>&- 2>/dev/null || true
   rm -f "$QEMU_FIFO" "$TEST_ISO" "$HOST_LOG" "$STORE_LOG" "$QEMU_LOG" "$UDP_LOG"
-  rm -f .test-limine.conf .test-good.c .test-df.c .test-ud.c .test-guard.c .test-kernel.c .test-dual.c .test-resowner.c .test-reswait.c .test-resfault.c .test-restimeout.c .test-store-noowner.c .test-store-owner.c .test-store-waiter.c .test-store-stat.c .test-udpcheck.c .test-udp-server.py .test-timeout.c
+  rm -f .test-limine.conf .test-good.c .test-df.c .test-ud.c .test-guard.c .test-kernel.c .test-dual.c .test-resowner.c .test-reswait.c .test-resfault.c .test-restimeout.c .test-store-noowner.c .test-store-owner.c .test-store-waiter.c .test-store-stat.c .test-udpcheck.c .test-udp-server.py .test-periodicslow.c .test-periodic.log .test-timeout.c
   rm -rf .test-iso-root "$HOST_ROOT" "$RUNTIME_ROOT" "$OUTSIDE"
 }
 trap cleanup EXIT INT TERM
@@ -405,6 +405,20 @@ int gm_main(const char *args,uint64_t arg_len) {
   return 0;
 }
 SRC
+cat > .test-periodicslow.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  uint64_t start;
+  (void)args;
+  (void)arg_len;
+  gm_write("PERIODIC_SLOW_START\n");
+  start=gm_ticks();
+  for (;gm_ticks()-start<250ULL;) {}
+  gm_write("PERIODIC_SLOW_END\n");
+  return 0;
+}
+SRC
 cat > .test-timeout.c <<'SRC'
 // Gianluca Mazzini @2026- Version 1.0
 #include "gmprog.h"
@@ -430,10 +444,12 @@ make -s gm SRC=.test-store-owner.c OUT="$RUNTIME_ROOT/programs/x86_64/storeowner
 make -s gm SRC=.test-store-waiter.c OUT="$RUNTIME_ROOT/programs/x86_64/storewaiter.gm"
 make -s gm SRC=.test-store-stat.c OUT="$RUNTIME_ROOT/programs/x86_64/storestat.gm"
 make -s gm SRC=.test-udpcheck.c OUT="$RUNTIME_ROOT/programs/x86_64/udpcheck.gm"
+make -s gm SRC=.test-periodicslow.c OUT="$RUNTIME_ROOT/programs/x86_64/periodicslow.gm"
 make -s gm SRC=.test-timeout.c OUT="$RUNTIME_ROOT/programs/x86_64/timeout.gm"
 make -s gm SRC=gmapps/diag.c OUT="$RUNTIME_ROOT/programs/x86_64/diag.gm"
 make -s gm SRC=gmapps/storecat.c OUT="$RUNTIME_ROOT/programs/x86_64/storecat.gm"
 make -s gm SRC=gmapps/ntp.c OUT="$RUNTIME_ROOT/programs/x86_64/ntp.gm"
+make -s gm SRC=gmapps/dns.c OUT="$RUNTIME_ROOT/programs/x86_64/dns.gm"
 cp "$RUNTIME_ROOT/programs/x86_64/good.gm" "$RUNTIME_ROOT/programs/x86_64/badimage.gm"
 printf '\001' | dd of="$RUNTIME_ROOT/programs/x86_64/badimage.gm" bs=1 seek=24 conv=notrunc status=none
 cp "$RUNTIME_ROOT/programs/x86_64/good.gm" "$RUNTIME_ROOT/programs/x86_64/api1.gm"
@@ -472,7 +488,7 @@ wait_new 'type help' 50 || fail "boot prompt"
 send_wait 'net' 'net state=up' 20
 send_wait 'ping 10.0.2.2' 'ok' 40
 send_wait 'store connect' 'error' 50
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 
 start_store
 send_wait 'store connect' 'ok' 50
@@ -486,6 +502,46 @@ send_wait 'resources' 'tcp owner=free held=0 waiters=0 acquisitions=0 total=0 ma
 
 send_wait 'run good' 'returned 7' 40
 new_has 'RUNTIME_GOOD' || fail "good program output"
+
+send_wait 'periodics' 'no periodics' 20
+PERIODIC_POS=$(wc -c < "$QEMU_LOG")
+printf 'every 1 3 good\n' >&3
+wait_new 'periodic 0 scheduled every=1s count=3' 20 || fail "periodic schedule"
+wait_new 'periodic 0 complete' 80 || fail "periodic completion"
+tail -c +$((PERIODIC_POS+1)) "$QEMU_LOG" | tr -d '\r' > .test-periodic.log
+[ "$(grep -Fc 'RUNTIME_GOOD' .test-periodic.log)" -eq 3 ] || fail "periodic launch count"
+[ "$(grep -Fc 'started slot 0 /programs/x86_64/good.gm' .test-periodic.log)" -eq 3 ] || fail "periodic start count"
+send_wait 'periodics' 'no periodics' 20
+
+PERIODIC_POS=$(wc -c < "$QEMU_LOG")
+printf 'every 1 2 periodicslow\n' >&3
+wait_new 'periodic 0 scheduled every=1s count=2' 20 || fail "periodic slow schedule"
+wait_new 'PERIODIC_SLOW_START' 30 || fail "periodic slow first start"
+sleep 1.3
+tail -c +$((PERIODIC_POS+1)) "$QEMU_LOG" | tr -d '\r' > .test-periodic.log
+[ "$(grep -Fc 'started slot 0 /programs/x86_64/periodicslow.gm' .test-periodic.log)" -eq 1 ] || fail "periodic overlap"
+wait_new 'periodic 0 complete' 100 || fail "periodic slow completion"
+tail -c +$((PERIODIC_POS+1)) "$QEMU_LOG" | tr -d '\r' > .test-periodic.log
+[ "$(grep -Fc 'PERIODIC_SLOW_START' .test-periodic.log)" -eq 2 ] || fail "periodic slow start count"
+[ "$(grep -Fc 'PERIODIC_SLOW_END' .test-periodic.log)" -eq 2 ] || fail "periodic slow end count"
+first_end=$(grep -n -m1 'PERIODIC_SLOW_END' .test-periodic.log | cut -d: -f1)
+second_start=$(grep -n 'started slot 0 /programs/x86_64/periodicslow.gm' .test-periodic.log | sed -n '2s/:.*//p')
+[ -n "$first_end" ] && [ -n "$second_start" ] && [ "$first_end" -lt "$second_start" ] || fail "periodic non-overlap order"
+rm -f .test-periodic.log
+
+PERIODIC_POS=$(wc -c < "$QEMU_LOG")
+LOG_POS=$PERIODIC_POS
+printf 'every 1 100 periodicslow\n' >&3
+wait_new 'periodic 0 scheduled every=1s count=100' 20 || fail "periodic cancel schedule"
+wait_new 'PERIODIC_SLOW_START' 30 || fail "periodic cancel running start"
+send_wait 'cancel 0' 'periodic 0 cancelled' 20
+send_wait 'periodics' 'no periodics' 20
+wait_new 'PERIODIC_SLOW_END' 40 || fail "cancelled periodic current app completes"
+sleep 1.3
+tail -c +$((PERIODIC_POS+1)) "$QEMU_LOG" | tr -d '\r' > .test-periodic.log
+[ "$(grep -Fc 'PERIODIC_SLOW_START' .test-periodic.log)" -eq 1 ] || fail "cancelled periodic future launch"
+[ "$(grep -Fc 'PERIODIC_SLOW_END' .test-periodic.log)" -eq 1 ] || fail "cancelled periodic current completion"
+rm -f .test-periodic.log
 send_wait 'run df' 'returned 0' 40
 new_has 'DF_OK' || fail "direction flag service"
 send_wait 'run ud' 'returned -106' 40
@@ -496,13 +552,13 @@ send_wait 'run kernelmap' 'returned -114' 40
 new_has 'program fault vector=14' || fail "kernel mapping user isolation"
 send_wait 'run badimage' 'program load error' 40
 send_wait 'run api1' 'program load error' 40
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 
 LOG_POS=$(wc -c < "$QEMU_LOG")
 printf 'run dual A\nrun dual B\n' >&3
 wait_new 'started slot 0 /programs/x86_64/dual.gm' 40 || fail "dual slot 0 start"
 wait_new 'started slot 1 /programs/x86_64/dual.gm' 40 || fail "dual slot 1 start"
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 send_wait 'ping 10.0.2.2' 'ok' 40
 wait_new 'DUAL_A_END' 80 || fail "round-robin app A"
 wait_new 'DUAL_B_END' 80 || fail "round-robin app B"
@@ -534,7 +590,7 @@ printf 'run restimeout
 run reswait
 ' >&3
 wait_new 'RES_TIMEOUT_ACQUIRED' 40 || fail "resource timeout owner acquire"
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 wait_new 'program timeout' 140 || fail "resource owner timeout"
 wait_new 'RES_WAITER_ACQUIRED' 40 || fail "resource release after timeout"
 wait_new 'app 1 returned 0' 40 || fail "resource waiter after timeout result"
@@ -591,14 +647,14 @@ LOG_POS=$(wc -c < "$QEMU_LOG")
 printf 'run timeout\nrun timeout\n' >&3
 wait_new 'started slot 0 /programs/x86_64/timeout.gm' 40 || fail "CPU-bound slot 0 start"
 wait_new 'started slot 1 /programs/x86_64/timeout.gm' 40 || fail "CPU-bound slot 1 start"
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 send_wait 'ping 10.0.2.2' 'ok' 40
 wait_new 'app 0 returned -200' 260 || fail "CPU-bound slot 0 timeout"
 wait_new 'app 1 returned -200' 260 || fail "CPU-bound slot 1 timeout"
 
 stop_store
 send_wait 'store ping' 'error' 50
-send_wait 'version' 'gmker 3.1' 20
+send_wait 'version' 'gmker 3.2' 20
 start_store
 send_wait 'store connect' 'ok' 50
 send_wait 'store cat /persist.txt' 'persist-ok' 30
@@ -614,4 +670,4 @@ QEMU_PID=
 stop_store
 
 echo 'QEMU runtime/recovery: OK'
-echo '===== OK GMKER 3.1 CONSOLIDATION TEST ====='
+echo '===== OK GMKER 3.2 CONSOLIDATION TEST ====='

@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.03
+// Gianluca Mazzini @2026- Version 2.04
 #include "gmker.h"
 
 #define GM_ETH_ARP 0x0806
@@ -402,7 +402,7 @@ int gm_ping(const uint8_t dst[4],uint64_t timeout) {
   gm_ping_seq++;
   packet[6]=(uint8_t)(gm_ping_seq>>8);
   packet[7]=(uint8_t)gm_ping_seq;
-  gm_memcpy(packet+8,"gmker 3.1 ping",14);
+  gm_memcpy(packet+8,"gmker 3.2 ping",14);
   sum=gm_checksum(packet,sizeof(packet));
   packet[2]=(uint8_t)(sum>>8);
   packet[3]=(uint8_t)sum;

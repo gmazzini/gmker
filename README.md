@@ -1,4 +1,4 @@
-# gmker 3.1
+# gmker 3.2
 
 gmker is a small x86_64 operating environment designed to remain understandable as a whole.
 
@@ -40,6 +40,26 @@ The PIT runs at 100 Hz. Timer interrupts advance the monotonic tick counter and 
 There are no kernel threads or Unix-style process scheduler. Up to four statically bounded application slots are scheduled round-robin with no priorities or dynamic policy. A timer interrupt from ring 3 saves the complete user register/iret frame, marks the application READY and returns to the kernel loop. Every application service call is also a scheduling point: the service result is saved in that application's context before control returns to the kernel. This prevents syscall-heavy applications from avoiding preemption.
 
 At every instant there remains one active CPU control path; concurrency is time multiplexing between isolated application contexts under kernel control.
+
+## Periodic application launch
+
+gmker 3.2 adds one bounded automatic-launch mechanism without adding cron, daemon processes, a wall clock or a second scheduler. The serial command is:
+
+```text
+every SECONDS COUNT NAME [ARGS]
+```
+
+For example:
+
+```text
+every 60 10 ntp 129.6.15.28
+```
+
+creates one fixed periodic entry that launches the existing gmapp through the normal GM01 loader after 60 seconds and then repeats until 10 actual launches have occurred. `SECONDS` is converted to the existing 100 Hz monotonic kernel tick counter; calendar time is not involved. The table contains at most four entries and every entry has a finite non-zero count.
+
+A periodic entry never overlaps with itself. If its previous gmapp is still running when another interval expires, or if all four application slots are occupied, the next launch is deferred rather than duplicated. Missed intervals are not accumulated: after each actual launch the next deadline becomes `now + interval`. A load failure does not consume `COUNT`; that entry retries on its next interval. Once the final launched gmapp terminates, the entry is removed automatically.
+
+`periodics` displays the fixed active table, including interval, remaining launches, seconds until the next deadline, currently associated application slot, program and arguments. `cancel ID` removes that periodic reservation immediately and prevents every future launch from it. Cancellation never terminates a gmapp that has already been launched: that application continues normally until return, fault or timeout. `cancel` therefore changes only future scheduling and is deliberately distinct from an application abort mechanism.
 
 ## Reliability model
 
@@ -226,13 +246,22 @@ gmker 3.1 adds the smallest UDP mechanism required by a concrete gmapp: one boun
 
 `gm_udp_exchange()` sends one datagram to an explicit IPv4 address and destination port from a temporary source port in the dynamic range, then waits for one matching reply from that exact peer. The kernel validates the UDP length and checksum, bounds payloads to `GM_UDP_MAX` (1024 bytes), and times out the exchange. Only one UDP exchange can be active because application access is serialized by `GM_RESOURCE_UDP`.
 
-The first real user is `gmapps/ntp.c`. NTP remains entirely application-level: the kernel knows only UDP. The application is invoked with an explicit server address:
+The maintained UDP users are `gmapps/ntp.c` and `gmapps/dns.c`. Both protocols remain entirely application-level: the kernel knows only bounded UDP exchange. NTP is invoked with an explicit server address:
 
 ```text
 run ntp 129.6.15.28
+run dns 172.64.32.162 example.com
 ```
 
 It sends a 48-byte NTP client request to UDP port 123, validates the basic server reply, converts the transmit timestamp to Unix time and prints UTC. No DNS server or NTP server is hardcoded in the kernel.
+
+The DNS gmapp is deliberately non-recursive and explicit:
+
+```text
+run dns DNS_SERVER_IP name
+```
+
+It sends one standard UDP/53 `A IN` query with `RD=0`, so it never asks the selected server to recurse. The gmapp validates the transaction ID and DNS response flags, rejects truncated/error replies, understands DNS compression pointers and prints `A` and `CNAME` answer records with TTL. It has no cache, resolver configuration, EDNS, DNSSEC, TCP fallback, server role or iterative referral chasing. Querying an authoritative server therefore provides a direct non-recursive lookup; querying a recursive resolver with `RD=0` may return only information that resolver already has available.
 
 ## TCP model
 
@@ -516,6 +545,7 @@ gmapps/diag.c        exercise core/store services including TCP ownership
 gmapps/storecat.c    acquire TCP, print a GMSTORE text object, then release TCP
 gmapps/netping.c     parse an IPv4 argument and ping it
 gmapps/ntp.c         acquire UDP and read UTC from an explicit NTP server IPv4 address
+gmapps/dns.c         issue one non-recursive A/IN DNS query to an explicit server
 ```
 
 Build outputs are deployed below `store/programs/x86_64/`. Example invocations are:
@@ -545,6 +575,9 @@ programs
 apps
 resources
 run NAME [ARGS]
+every SECONDS COUNT NAME [ARGS]
+periodics
+cancel ID
 store status
 store connect
 store ping
@@ -698,6 +731,10 @@ The test is bounded and self-cleaning. It validates:
 - ring-3 execution timeout and recovery;
 - simultaneous execution of two isolated applications under round-robin scheduling;
 - simultaneous pure CPU-bound applications preempted only by the timer;
+- bounded periodic application launch with exact finite launch count;
+- deferred periodic launch without overlapping a still-running prior instance;
+- automatic removal after the final periodic execution completes;
+- cancellation of future periodic launches while an already-running gmapp completes normally;
 - serial shell and network responsiveness while applications are running;
 - GMSTORE loss while running, shell survival, reconnect and persistent-data recovery;
 - clean QEMU shutdown through `isa-debug-exit`.
@@ -705,16 +742,16 @@ The test is bounded and self-cleaning. It validates:
 A successful run ends with:
 
 ```text
-===== OK GMKER 3.1 CONSOLIDATION TEST =====
+===== OK GMKER 3.2 CONSOLIDATION TEST =====
 ```
 
 The final clean-build x86_64 kernel image reports:
 
 ```text
-text   38380
+text   41385
 data     224
-bss    38352
-total  76956 bytes
+bss    40304
+total  81913 bytes
 ```
 
-This is the consolidation baseline for gmker 3.1 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.
+This is the consolidation baseline for gmker 3.2 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.

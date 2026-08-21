@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.02
+// Gianluca Mazzini @2026- Version 2.04
 #include "gmker.h"
 
 #define GM_LINE_MAX 512
@@ -32,6 +32,52 @@ static void gm_result(int ok) {
   gm_write(ok?"ok\n":"error\n");
 }
 
+static int gm_decimal(const char *text,uint64_t *value) {
+  uint64_t number;
+  uint64_t digit;
+
+  if (!text || !*text || !value) return 0;
+  number=0;
+  for (;*text;text++) {
+    if (*text<'0' || *text>'9') return 0;
+    digit=(uint64_t)(*text-'0');
+    if (number>(~0ULL-digit)/10ULL) return 0;
+    number=number*10ULL+digit;
+  }
+  *value=number;
+  return 1;
+}
+
+static void gm_every_command(char *args) {
+  char *seconds_text;
+  char *count_text;
+  char *name;
+  uint64_t seconds;
+  uint64_t count;
+
+  seconds_text=gm_word(&args);
+  count_text=gm_word(&args);
+  name=gm_word(&args);
+  if (!seconds_text || !count_text || !name || !gm_decimal(seconds_text,&seconds) ||
+      !gm_decimal(count_text,&count) || !seconds || !count || count>0xffffffffULL) {
+    gm_write("usage: every SECONDS COUNT NAME [ARGS]\n");
+    return;
+  }
+  if (!gm_periodic_add(seconds,(uint32_t)count,name,gm_rest(args))) gm_write("every error\n");
+}
+
+static void gm_cancel_command(char *args) {
+  char *id_text;
+  uint64_t id;
+
+  id_text=gm_word(&args);
+  if (!id_text || gm_rest(args) || !gm_decimal(id_text,&id) || id>0xffffffffULL) {
+    gm_write("usage: cancel ID\n");
+    return;
+  }
+  if (!gm_periodic_cancel((uint32_t)id)) gm_write("cancel error\n");
+}
+
 static void gm_help(void) {
   gm_write("help                 commands\n");
   gm_write("version              kernel version\n");
@@ -45,6 +91,9 @@ static void gm_help(void) {
   gm_write("apps                 application slots\n");
   gm_write("resources            resource ownership/accounting\n");
   gm_write("run NAME [ARGS]      load and run GMSTORE program\n");
+  gm_write("every SEC N NAME [A]  run program periodically\n");
+  gm_write("periodics            periodic launch status\n");
+  gm_write("cancel ID            cancel future periodic launches\n");
   gm_write("store status         GMSTORE status\n");
   gm_write("store connect        connect GMSTORE\n");
   gm_write("store ping           ping GMSTORE\n");
@@ -135,6 +184,9 @@ static void gm_command(char *line) {
   else if (gm_streq(cmd,"programs")) gm_programs_list();
   else if (gm_streq(cmd,"apps")) gm_programs_status();
   else if (gm_streq(cmd,"resources")) gm_resources_status();
+  else if (gm_streq(cmd,"periodics")) gm_periodics_status();
+  else if (gm_streq(cmd,"every")) gm_every_command(args);
+  else if (gm_streq(cmd,"cancel")) gm_cancel_command(args);
   else if (gm_streq(cmd,"run")) {
     value=gm_word(&args);
     if (!value) gm_write("usage: run NAME [ARGS]\n");

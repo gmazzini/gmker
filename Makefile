@@ -36,7 +36,7 @@ gm: gmpack gmprog.h gmabi.h gmprog.ld
 
 check: gmker.elf gmstored gmpack
 	@size gmker.elf
-	@echo "===== OK GMKER 3.1 ====="
+	@echo "===== OK GMKER 3.2 ====="
 
 test: check iso
 	@./test_runtime.sh

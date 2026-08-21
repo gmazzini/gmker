@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.10
+// Gianluca Mazzini @2026- Version 2.13
 #include "gmker.h"
 
 
@@ -44,6 +44,12 @@ struct gm_service_frame {
 #define GM_RESOURCE_BUCKETS 60U
 #define GM_RESOURCE_BUCKET_TICKS (10ULL*GM_TICK_HZ)
 #define GM_RESOURCE_WINDOW_TICKS (GM_RESOURCE_BUCKETS*GM_RESOURCE_BUCKET_TICKS)
+#define GM_PERIODIC_MAX 4U
+#define GM_PERIODIC_NAME_MAX 192U
+#define GM_PERIODIC_ARGS_MAX 256U
+#define GM_START_BUSY 0
+#define GM_START_OK 1
+#define GM_START_ERROR -1
 
 struct gm_app_slot {
   uint64_t resume_rsp;
@@ -57,6 +63,7 @@ struct gm_app_slot {
   struct gm_service_frame context;
   uint32_t owned_resource;
   uint32_t waiting_resource;
+  uint32_t periodic_id;
 };
 
 struct gm_resource {
@@ -71,10 +78,21 @@ struct gm_resource {
   uint32_t recent[GM_RESOURCE_BUCKETS];
 };
 
+struct gm_periodic {
+  uint64_t interval_ticks;
+  uint64_t next_tick;
+  uint32_t remaining;
+  uint32_t slot;
+  uint8_t active;
+  char name[GM_PERIODIC_NAME_MAX];
+  char args[GM_PERIODIC_ARGS_MAX];
+};
+
 struct gm_app_slot *gm_program_current;
 
 static struct gm_app_slot gm_apps[GM_APP_MAX];
 static struct gm_resource gm_resources[GM_RESOURCE_COUNT];
+static struct gm_periodic gm_periodics[GM_PERIODIC_MAX];
 static uint64_t gm_resource_epochs[GM_RESOURCE_BUCKETS];
 static uint64_t gm_program_kernel_cr3;
 static uint32_t gm_program_next;
@@ -471,6 +489,7 @@ void gm_programs_init(void) {
   gm_program_kernel_cr3=gm_address_space_current();
   gm_memset(gm_apps,0,sizeof(gm_apps));
   gm_memset(gm_resources,0,sizeof(gm_resources));
+  gm_memset(gm_periodics,0,sizeof(gm_periodics));
   gm_memset(gm_resource_epochs,0,sizeof(gm_resource_epochs));
   for (i=0;i<GM_APP_MAX;i++) {
     app=&gm_apps[i];
@@ -491,6 +510,7 @@ void gm_programs_init(void) {
     app->resume_rsp=0;
     app->owned_resource=GM_RESOURCE_NONE;
     app->waiting_resource=GM_RESOURCE_NONE;
+    app->periodic_id=0;
     gm_memset(&app->context,0,sizeof(app->context));
     gm_program_kernel();
   }
@@ -507,15 +527,13 @@ void gm_programs_list(void) {
   if (!gm_store_list_prefix("/programs/" GM_ARCH_NAME "/")) gm_write("programs unavailable\n");
 }
 
-int gm_program_run(const char *name,const char *args) {
+static int gm_program_start_path(const char *path,const char *args,uint32_t periodic_id,uint32_t *slot_out,int report) {
   struct gm_app_slot *app;
   struct gm_image_header header;
-  char path[192];
   uint64_t arg_len;
   uint64_t stack;
   uint32_t slot;
 
-  if (!gm_program_path(name,path)) return 0;
   app=0;
   slot=0;
   for (;slot<GM_APP_MAX;slot++) {
@@ -525,22 +543,22 @@ int gm_program_run(const char *name,const char *args) {
     }
   }
   if (!app) {
-    gm_write("no free app slot\n");
-    return 1;
+    if (report) gm_write("no free app slot\n");
+    return GM_START_BUSY;
   }
   gm_program_activate(app);
   if (!gm_program_load(path,&header)) {
     gm_program_kernel();
-    gm_write("program load error\n");
-    return 1;
+    if (report) gm_write("program load error\n");
+    return GM_START_ERROR;
   }
-  arg_len=gm_strlen(args);
+  arg_len=args?gm_strlen(args):0;
   if (arg_len>=GM_PROGRAM_ARG_SIZE-16U) {
     gm_program_kernel();
-    gm_write("program args too long\n");
-    return 1;
+    if (report) gm_write("program args too long\n");
+    return GM_START_ERROR;
   }
-  if (args && arg_len) gm_memcpy(app->arg,args,arg_len);
+  if (arg_len) gm_memcpy(app->arg,args,arg_len);
   app->arg[arg_len]=0;
   stack=GM_PROGRAM_STACK+GM_PROGRAM_STACK_SIZE-8U;
   gm_program_return_stub((uint64_t *)stack);
@@ -556,14 +574,153 @@ int gm_program_run(const char *name,const char *args) {
   app->result=-1;
   app->owned_resource=GM_RESOURCE_NONE;
   app->waiting_resource=GM_RESOURCE_NONE;
+  app->periodic_id=periodic_id;
   app->state=GM_APP_READY;
   gm_program_kernel();
+  if (slot_out) *slot_out=slot;
   gm_write("started slot ");
   gm_print_u64(slot);
   gm_write(" ");
   gm_write(path);
   gm_write("\n");
+  return GM_START_OK;
+}
+
+int gm_program_run(const char *name,const char *args) {
+  char path[GM_PERIODIC_NAME_MAX];
+
+  if (!gm_program_path(name,path)) return 0;
+  (void)gm_program_start_path(path,args,0,0,1);
   return 1;
+}
+
+int gm_periodic_add(uint64_t seconds,uint32_t count,const char *name,const char *args) {
+  struct gm_periodic *periodic;
+  char path[GM_PERIODIC_NAME_MAX];
+  uint64_t arg_len;
+  uint64_t interval;
+  uint64_t now;
+  uint32_t i;
+
+  if (!seconds || !count || seconds>~0ULL/GM_TICK_HZ || !gm_program_path(name,path)) return 0;
+  arg_len=args?gm_strlen(args):0;
+  if (arg_len>=GM_PERIODIC_ARGS_MAX) return 0;
+  periodic=0;
+  for (i=0;i<GM_PERIODIC_MAX;i++) {
+    if (!gm_periodics[i].active) {
+      periodic=&gm_periodics[i];
+      break;
+    }
+  }
+  if (!periodic) return 0;
+  interval=seconds*GM_TICK_HZ;
+  now=gm_ticks();
+  if (now>~0ULL-interval) return 0;
+  gm_memset(periodic,0,sizeof(*periodic));
+  gm_memcpy(periodic->name,path,gm_strlen(path)+1U);
+  if (arg_len) gm_memcpy(periodic->args,args,arg_len);
+  periodic->args[arg_len]=0;
+  periodic->interval_ticks=interval;
+  periodic->next_tick=now+interval;
+  periodic->remaining=count;
+  periodic->slot=GM_APP_MAX;
+  periodic->active=1;
+  gm_write("periodic ");
+  gm_print_u64(i);
+  gm_write(" scheduled every=");
+  gm_print_u64(seconds);
+  gm_write("s count=");
+  gm_print_u64(count);
+  gm_write(" app=");
+  gm_write(path);
+  gm_write("\n");
+  return 1;
+}
+
+int gm_periodic_cancel(uint32_t id) {
+  if (id>=GM_PERIODIC_MAX || !gm_periodics[id].active) return 0;
+  gm_periodics[id].active=0;
+  gm_write("periodic ");
+  gm_print_u64(id);
+  gm_write(" cancelled\n");
+  return 1;
+}
+
+void gm_periodics_status(void) {
+  struct gm_periodic *periodic;
+  uint64_t now;
+  uint64_t due;
+  uint32_t i;
+  int found;
+
+  now=gm_ticks();
+  found=0;
+  for (i=0;i<GM_PERIODIC_MAX;i++) {
+    periodic=&gm_periodics[i];
+    if (!periodic->active) continue;
+    found=1;
+    due=periodic->next_tick>now?(periodic->next_tick-now+GM_TICK_HZ-1U)/GM_TICK_HZ:0;
+    gm_write("periodic ");
+    gm_print_u64(i);
+    gm_write(" every=");
+    gm_print_u64(periodic->interval_ticks/GM_TICK_HZ);
+    gm_write("s remaining=");
+    gm_print_u64(periodic->remaining);
+    gm_write(" due=");
+    gm_print_u64(due);
+    gm_write("s running=");
+    if (periodic->slot<GM_APP_MAX) {
+      gm_write("app");
+      gm_print_u64(periodic->slot);
+    } else gm_write("-");
+    gm_write(" app=");
+    gm_write(periodic->name);
+    if (periodic->args[0]) {
+      gm_write(" args=");
+      gm_write(periodic->args);
+    }
+    gm_write("\n");
+  }
+  if (!found) gm_write("no periodics\n");
+}
+
+void gm_periodic_poll(void) {
+  struct gm_periodic *periodic;
+  uint64_t now;
+  uint32_t slot;
+  uint32_t i;
+  int rc;
+
+  now=gm_ticks();
+  for (i=0;i<GM_PERIODIC_MAX;i++) {
+    periodic=&gm_periodics[i];
+    if (!periodic->active) continue;
+    if (periodic->slot<GM_APP_MAX) {
+      if (gm_apps[periodic->slot].periodic_id==i+1U && gm_apps[periodic->slot].state!=GM_APP_FREE) continue;
+      periodic->slot=GM_APP_MAX;
+      if (!periodic->remaining) {
+        periodic->active=0;
+        gm_write("periodic ");
+        gm_print_u64(i);
+        gm_write(" complete\n");
+        continue;
+      }
+    }
+    if (now<periodic->next_tick) continue;
+    slot=GM_APP_MAX;
+    rc=gm_program_start_path(periodic->name,periodic->args,i+1U,&slot,0);
+    if (rc==GM_START_BUSY) continue;
+    if (rc==GM_START_ERROR) {
+      periodic->next_tick=now+periodic->interval_ticks;
+      gm_write("periodic ");
+      gm_print_u64(i);
+      gm_write(" launch error\n");
+      continue;
+    }
+    periodic->slot=slot;
+    periodic->remaining--;
+    periodic->next_tick=now+periodic->interval_ticks;
+  }
 }
 
 static void gm_program_result(struct gm_app_slot *app) {

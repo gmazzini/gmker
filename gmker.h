@@ -7,7 +7,7 @@
 #include "limine.h"
 #include "gmabi.h"
 
-#define GM_VERSION "3.1"
+#define GM_VERSION "3.2"
 #define GM_TICK_HZ 100U
 #define GM_PAGE_SIZE 4096ULL
 #define GM_NET_MTU 1500U
@@ -149,6 +149,10 @@ void gm_programs_list(void);
 void gm_programs_status(void);
 void gm_resources_status(void);
 int gm_program_run(const char *name,const char *args);
+int gm_periodic_add(uint64_t seconds,uint32_t count,const char *name,const char *args);
+int gm_periodic_cancel(uint32_t id);
+void gm_periodics_status(void);
+void gm_periodic_poll(void);
 void gm_program_resume_user(void *frame);
 int gm_program_schedule(void);
 int gm_program_service(void *frame);
