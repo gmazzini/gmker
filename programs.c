@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.01
+// Gianluca Mazzini @2026- Version 2.09
 #include "gmker.h"
 
 
@@ -34,14 +34,280 @@ struct gm_service_frame {
   uint64_t ss;
 };
 
-volatile uint64_t gm_program_resume_rsp;
-volatile int gm_program_result;
+#define GM_APP_MAX 4U
+#define GM_APP_FREE 0U
+#define GM_APP_READY 1U
+#define GM_APP_RUNNING 2U
+#define GM_APP_BLOCKED 3U
+#define GM_RESOURCE_NONE 0U
+#define GM_RESOURCE_COUNT 1U
+#define GM_RESOURCE_BUCKETS 60U
+#define GM_RESOURCE_BUCKET_TICKS (10ULL*GM_TICK_HZ)
+#define GM_RESOURCE_WINDOW_TICKS (GM_RESOURCE_BUCKETS*GM_RESOURCE_BUCKET_TICKS)
 
-static uint8_t *gm_program_image;
-static uint8_t *gm_program_arg;
-static uint8_t *gm_program_stack;
-static uint64_t gm_program_started;
-static int gm_program_running;
+struct gm_app_slot {
+  uint64_t resume_rsp;
+  int result;
+  uint32_t state;
+  uint64_t runtime_ticks;
+  uint64_t cr3;
+  uint8_t *image;
+  uint8_t *arg;
+  uint8_t *stack;
+  struct gm_service_frame context;
+  uint32_t owned_resource;
+  uint32_t waiting_resource;
+};
+
+struct gm_resource {
+  uint32_t owner;
+  uint32_t wait[GM_APP_MAX];
+  uint32_t wait_head;
+  uint32_t wait_len;
+  uint64_t acquired_tick;
+  uint64_t total_ticks;
+  uint64_t acquisitions;
+  uint64_t max_hold;
+  uint32_t recent[GM_RESOURCE_BUCKETS];
+};
+
+struct gm_app_slot *gm_program_current;
+
+static struct gm_app_slot gm_apps[GM_APP_MAX];
+static struct gm_resource gm_resources[GM_RESOURCE_COUNT];
+static uint64_t gm_resource_epochs[GM_RESOURCE_BUCKETS];
+static uint64_t gm_program_kernel_cr3;
+static uint32_t gm_program_next;
+
+static void gm_program_kernel(void);
+
+static uint32_t gm_program_slot(const struct gm_app_slot *app) {
+  return (uint32_t)(app-gm_apps);
+}
+
+static struct gm_resource *gm_resource_get(uint32_t resource) {
+  if (resource!=GM_RESOURCE_TCP) return 0;
+  return &gm_resources[resource-1U];
+}
+
+static int gm_resource_owned(const struct gm_app_slot *app,uint32_t resource_id) {
+  struct gm_resource *resource;
+  uint32_t slot;
+
+  resource=gm_resource_get(resource_id);
+  if (!resource || app->owned_resource!=resource_id) return 0;
+  slot=gm_program_slot(app);
+  if (resource->owner!=slot+1U) gm_panic("resource owner");
+  return 1;
+}
+
+static void gm_resource_bucket(uint64_t epoch) {
+  uint32_t bucket;
+  uint32_t i;
+
+  bucket=(uint32_t)(epoch%GM_RESOURCE_BUCKETS);
+  if (gm_resource_epochs[bucket]==epoch+1ULL) return;
+  gm_resource_epochs[bucket]=epoch+1ULL;
+  for (i=0;i<GM_RESOURCE_COUNT;i++) gm_resources[i].recent[bucket]=0;
+}
+
+static void gm_resource_account(struct gm_resource *resource,uint64_t now) {
+  uint64_t start;
+  uint64_t end;
+  uint64_t epoch;
+  uint64_t hold;
+  uint32_t bucket;
+
+  start=resource->acquired_tick;
+  if (now<start) return;
+  hold=now-start;
+  resource->total_ticks+=hold;
+  if (hold>resource->max_hold) resource->max_hold=hold;
+  if (hold>GM_RESOURCE_WINDOW_TICKS) start=now-GM_RESOURCE_WINDOW_TICKS;
+  for (;start<now;start=end) {
+    epoch=start/GM_RESOURCE_BUCKET_TICKS;
+    gm_resource_bucket(epoch);
+    bucket=(uint32_t)(epoch%GM_RESOURCE_BUCKETS);
+    end=(epoch+1ULL)*GM_RESOURCE_BUCKET_TICKS;
+    if (end>now) end=now;
+    resource->recent[bucket]+=(uint32_t)(end-start);
+  }
+}
+
+static int gm_resource_wait(struct gm_resource *resource,uint32_t slot) {
+  uint32_t tail;
+
+  if (resource->wait_len>=GM_APP_MAX) return 0;
+  tail=(resource->wait_head+resource->wait_len)%GM_APP_MAX;
+  resource->wait[tail]=slot;
+  resource->wait_len++;
+  return 1;
+}
+
+static void gm_resource_grant_next(struct gm_resource *resource,uint32_t resource_id,uint64_t now) {
+  struct gm_app_slot *app;
+  uint32_t slot;
+
+  if (!resource->wait_len) return;
+  slot=resource->wait[resource->wait_head];
+  resource->wait_head=(resource->wait_head+1U)%GM_APP_MAX;
+  resource->wait_len--;
+  if (slot>=GM_APP_MAX) gm_panic("resource waiter");
+  app=&gm_apps[slot];
+  if (app->state!=GM_APP_BLOCKED || app->waiting_resource!=resource_id || app->owned_resource)
+    gm_panic("resource wait state");
+  resource->owner=slot+1U;
+  resource->acquired_tick=now;
+  resource->acquisitions++;
+  app->waiting_resource=GM_RESOURCE_NONE;
+  app->owned_resource=resource_id;
+  app->context.rax=1;
+  app->state=GM_APP_READY;
+}
+
+static int gm_resource_release_app(struct gm_app_slot *app,uint32_t resource_id) {
+  struct gm_resource *resource;
+  uint32_t slot;
+  uint64_t now;
+
+  resource=gm_resource_get(resource_id);
+  slot=gm_program_slot(app);
+  if (!resource || app->owned_resource!=resource_id || resource->owner!=slot+1U) return 0;
+  now=gm_ticks();
+  gm_resource_account(resource,now);
+  resource->owner=0;
+  app->owned_resource=GM_RESOURCE_NONE;
+  gm_resource_grant_next(resource,resource_id,now);
+  return 1;
+}
+
+static void gm_resource_reclaim(struct gm_app_slot *app) {
+  uint32_t resource;
+
+  resource=app->owned_resource;
+  if (resource && !gm_resource_release_app(app,resource)) gm_panic("resource reclaim");
+}
+
+static int gm_resource_acquire_service(struct gm_app_slot *app,uint32_t resource_id,
+                                       struct gm_service_frame *frame) {
+  struct gm_resource *resource;
+  uint32_t slot;
+
+  resource=gm_resource_get(resource_id);
+  if (!resource || app->owned_resource || app->waiting_resource) {
+    frame->rax=0;
+    return 0;
+  }
+  slot=gm_program_slot(app);
+  if (!resource->owner) {
+    resource->owner=slot+1U;
+    resource->acquired_tick=gm_ticks();
+    resource->acquisitions++;
+    app->owned_resource=resource_id;
+    frame->rax=1;
+    return 0;
+  }
+  if (!gm_resource_wait(resource,slot)) gm_panic("resource wait full");
+  gm_memcpy(&app->context,frame,sizeof(app->context));
+  app->waiting_resource=resource_id;
+  app->state=GM_APP_BLOCKED;
+  gm_program_kernel();
+  return 1;
+}
+
+static const char *gm_app_state_name(uint32_t state) {
+  if (state==GM_APP_FREE) return "free";
+  if (state==GM_APP_READY) return "ready";
+  if (state==GM_APP_RUNNING) return "running";
+  if (state==GM_APP_BLOCKED) return "blocked";
+  return "invalid";
+}
+
+static const char *gm_resource_name(uint32_t resource) {
+  if (resource==GM_RESOURCE_TCP) return "tcp";
+  return "-";
+}
+
+static uint64_t gm_resource_live(const struct gm_resource *resource,uint64_t now) {
+  if (!resource->owner || now<resource->acquired_tick) return 0;
+  return now-resource->acquired_tick;
+}
+
+static uint64_t gm_resource_recent(const struct gm_resource *resource,uint64_t now) {
+  uint64_t current_epoch;
+  uint64_t epoch;
+  uint64_t start;
+  uint64_t recent;
+  uint32_t i;
+
+  current_epoch=now/GM_RESOURCE_BUCKET_TICKS;
+  recent=0;
+  for (i=0;i<GM_RESOURCE_BUCKETS;i++) {
+    if (!gm_resource_epochs[i]) continue;
+    epoch=gm_resource_epochs[i]-1ULL;
+    if (epoch<=current_epoch && current_epoch-epoch<GM_RESOURCE_BUCKETS) recent+=resource->recent[i];
+  }
+  if (resource->owner && now>=resource->acquired_tick) {
+    start=resource->acquired_tick;
+    if (now>GM_RESOURCE_WINDOW_TICKS && start<now-GM_RESOURCE_WINDOW_TICKS)
+      start=now-GM_RESOURCE_WINDOW_TICKS;
+    recent+=now-start;
+  }
+  return recent;
+}
+
+void gm_programs_status(void) {
+  struct gm_app_slot *app;
+  uint32_t i;
+
+  for (i=0;i<GM_APP_MAX;i++) {
+    app=&gm_apps[i];
+    gm_write("app ");
+    gm_print_u64(i);
+    gm_write(" ");
+    gm_write(gm_app_state_name(app->state));
+    gm_write(" ticks=");
+    gm_print_u64(app->runtime_ticks);
+    gm_write(" owns=");
+    gm_write(gm_resource_name(app->owned_resource));
+    gm_write(" waits=");
+    gm_write(gm_resource_name(app->waiting_resource));
+    gm_write("\n");
+  }
+}
+
+void gm_resources_status(void) {
+  struct gm_resource *resource;
+  uint64_t now;
+  uint64_t live;
+  uint64_t total;
+  uint64_t longest;
+
+  resource=&gm_resources[GM_RESOURCE_TCP-1U];
+  now=gm_ticks();
+  live=gm_resource_live(resource,now);
+  total=resource->total_ticks+live;
+  longest=resource->max_hold;
+  if (live>longest) longest=live;
+  gm_write("tcp owner=");
+  if (resource->owner) {
+    gm_write("app");
+    gm_print_u64(resource->owner-1U);
+  } else gm_write("free");
+  gm_write(" held=");
+  gm_print_u64(live);
+  gm_write(" waiters=");
+  gm_print_u64(resource->wait_len);
+  gm_write(" acquisitions=");
+  gm_print_u64(resource->acquisitions);
+  gm_write(" total=");
+  gm_print_u64(total);
+  gm_write(" max=");
+  gm_print_u64(longest);
+  gm_write(" recent10m=");
+  gm_print_u64(gm_resource_recent(resource,now));
+  gm_write(" ticks\n");
+}
 
 static uint32_t gm_u32(const uint8_t *p) {
   return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
@@ -88,9 +354,38 @@ static int gm_user_string(uint64_t addr,uint64_t max,uint64_t *len) {
 }
 
 static void gm_program_clear(void) {
-  gm_memset(gm_program_image,0,GM_PROGRAM_IMAGE_MAX);
-  gm_memset(gm_program_arg,0,GM_PROGRAM_ARG_SIZE);
-  gm_memset(gm_program_stack,0,GM_PROGRAM_STACK_SIZE);
+  gm_memset(gm_program_current->image,0,GM_PROGRAM_IMAGE_MAX);
+  gm_memset(gm_program_current->arg,0,GM_PROGRAM_ARG_SIZE);
+  gm_memset(gm_program_current->stack,0,GM_PROGRAM_STACK_SIZE);
+}
+
+static void gm_program_activate(struct gm_app_slot *app) {
+  gm_program_current=app;
+  gm_address_space_switch(app->cr3);
+}
+
+static void gm_program_kernel(void) {
+  gm_address_space_switch(gm_program_kernel_cr3);
+}
+
+static void gm_program_isolation_check(void) {
+  volatile uint64_t *probe;
+
+  probe=(volatile uint64_t *)GM_PROGRAM_BASE;
+  gm_program_activate(&gm_apps[0]);
+  *probe=0x1122334455667788ULL;
+  gm_program_activate(&gm_apps[1]);
+  if (*probe) gm_panic("program isolation");
+  *probe=0x8877665544332211ULL;
+  gm_program_activate(&gm_apps[0]);
+  if (*probe!=0x1122334455667788ULL) gm_panic("program isolation");
+  gm_program_activate(&gm_apps[1]);
+  if (*probe!=0x8877665544332211ULL) gm_panic("program isolation");
+  gm_program_clear();
+  gm_program_activate(&gm_apps[0]);
+  gm_program_clear();
+  gm_program_kernel();
+  gm_program_current=&gm_apps[0];
 }
 
 static int gm_program_path(const char *name,char path[192]) {
@@ -142,10 +437,10 @@ static int gm_program_load(const char *path,struct gm_image_header *header) {
   remain=payload;
   for (;remain;remain-=want) {
     want=remain>GM_STORE_BLOCK?GM_STORE_BLOCK:(uint16_t)remain;
-    if (!gm_store_read(path,GM_PROGRAM_HEADER_SIZE+offset,gm_program_image+offset,want,&got) || got!=want) return 0;
+    if (!gm_store_read(path,GM_PROGRAM_HEADER_SIZE+offset,gm_program_current->image+offset,want,&got) || got!=want) return 0;
     offset+=want;
   }
-  if (gm_image_checksum(gm_program_image,payload)!=header->checksum) return 0;
+  if (gm_image_checksum(gm_program_current->image,payload)!=header->checksum) return 0;
   return 1;
 }
 
@@ -159,25 +454,40 @@ static void gm_program_return_stub(uint64_t *stack) {
 }
 
 void gm_programs_init(void) {
+  struct gm_app_slot *app;
   uint64_t phys;
   uint64_t virt;
   uint64_t i;
 
-  gm_program_image=(uint8_t *)GM_PROGRAM_BASE;
-  gm_program_arg=(uint8_t *)GM_PROGRAM_ARG;
-  gm_program_stack=(uint8_t *)GM_PROGRAM_STACK;
-  for (virt=GM_PROGRAM_BASE;virt<GM_PROGRAM_END;virt+=GM_PAGE_SIZE) {
-    if (virt==GM_PROGRAM_GUARD) continue;
-    phys=gm_page_alloc();
-    if (!gm_map_user_page(virt,phys,0x002ULL)) gm_panic("program map");
+  gm_program_kernel_cr3=gm_address_space_current();
+  gm_memset(gm_apps,0,sizeof(gm_apps));
+  gm_memset(gm_resources,0,sizeof(gm_resources));
+  gm_memset(gm_resource_epochs,0,sizeof(gm_resource_epochs));
+  for (i=0;i<GM_APP_MAX;i++) {
+    app=&gm_apps[i];
+    app->cr3=gm_address_space_create();
+    app->image=(uint8_t *)GM_PROGRAM_BASE;
+    app->arg=(uint8_t *)GM_PROGRAM_ARG;
+    app->stack=(uint8_t *)GM_PROGRAM_STACK;
+    for (virt=GM_PROGRAM_BASE;virt<GM_PROGRAM_END;virt+=GM_PAGE_SIZE) {
+      if (virt==GM_PROGRAM_GUARD) continue;
+      phys=gm_page_alloc();
+      if (!gm_map_user_page_in(app->cr3,virt,phys,0x002ULL)) gm_panic("program map");
+    }
+    gm_program_activate(app);
+    gm_program_clear();
+    app->state=GM_APP_FREE;
+    app->result=0;
+    app->runtime_ticks=0;
+    app->resume_rsp=0;
+    app->owned_resource=GM_RESOURCE_NONE;
+    app->waiting_resource=GM_RESOURCE_NONE;
+    gm_memset(&app->context,0,sizeof(app->context));
+    gm_program_kernel();
   }
-  for (i=0;i<GM_PROGRAM_END-GM_PROGRAM_BASE;i+=GM_PAGE_SIZE) {
-    if (GM_PROGRAM_BASE+i==GM_PROGRAM_GUARD) continue;
-    gm_memset((void *)(GM_PROGRAM_BASE+i),0,GM_PAGE_SIZE);
-  }
-  gm_program_running=0;
-  gm_program_result=0;
-  gm_program_resume_rsp=0;
+  gm_program_current=&gm_apps[0];
+  gm_program_next=0;
+  gm_program_isolation_check();
 }
 
 void gm_programs_list(void) {
@@ -189,42 +499,110 @@ void gm_programs_list(void) {
 }
 
 int gm_program_run(const char *name,const char *args) {
+  struct gm_app_slot *app;
   struct gm_image_header header;
   char path[192];
   uint64_t arg_len;
   uint64_t stack;
-  int result;
+  uint32_t slot;
 
-  if (gm_program_running || !gm_program_path(name,path)) return 0;
+  if (!gm_program_path(name,path)) return 0;
+  app=0;
+  slot=0;
+  for (;slot<GM_APP_MAX;slot++) {
+    if (gm_apps[slot].state==GM_APP_FREE) {
+      app=&gm_apps[slot];
+      break;
+    }
+  }
+  if (!app) {
+    gm_write("no free app slot\n");
+    return 1;
+  }
+  gm_program_activate(app);
   if (!gm_program_load(path,&header)) {
+    gm_program_kernel();
     gm_write("program load error\n");
     return 1;
   }
   arg_len=gm_strlen(args);
   if (arg_len>=GM_PROGRAM_ARG_SIZE-16U) {
+    gm_program_kernel();
     gm_write("program args too long\n");
     return 1;
   }
-  if (args && arg_len) gm_memcpy(gm_program_arg,args,arg_len);
-  gm_program_arg[arg_len]=0;
+  if (args && arg_len) gm_memcpy(app->arg,args,arg_len);
+  app->arg[arg_len]=0;
   stack=GM_PROGRAM_STACK+GM_PROGRAM_STACK_SIZE-8U;
   gm_program_return_stub((uint64_t *)stack);
-  gm_program_running=1;
-  gm_program_started=gm_ticks();
-  gm_program_result=-1;
-  gm_write("program ");
+  gm_memset(&app->context,0,sizeof(app->context));
+  app->context.rdi=GM_PROGRAM_ARG;
+  app->context.rsi=arg_len;
+  app->context.rip=GM_PROGRAM_BASE+header.entry;
+  app->context.cs=0x23ULL;
+  app->context.rflags=0x202ULL;
+  app->context.rsp=stack;
+  app->context.ss=0x1bULL;
+  app->runtime_ticks=0;
+  app->result=-1;
+  app->owned_resource=GM_RESOURCE_NONE;
+  app->waiting_resource=GM_RESOURCE_NONE;
+  app->state=GM_APP_READY;
+  gm_program_kernel();
+  gm_write("started slot ");
+  gm_print_u64(slot);
+  gm_write(" ");
   gm_write(path);
   gm_write("\n");
-  result=gm_program_enter(GM_PROGRAM_BASE+header.entry,stack,GM_PROGRAM_ARG,arg_len);
-  gm_program_running=0;
-  gm_write("returned ");
-  if (result<0) {
+  return 1;
+}
+
+static void gm_program_result(struct gm_app_slot *app) {
+  gm_write("app ");
+  gm_print_u64(gm_program_slot(app));
+  gm_write(" returned ");
+  if (app->result<0) {
     gm_write("-");
-    gm_print_u64((uint64_t)(-result));
+    gm_print_u64((uint64_t)(-app->result));
   } else {
-    gm_print_u64((uint64_t)result);
+    gm_print_u64((uint64_t)app->result);
   }
   gm_write("\n");
+}
+
+static void gm_program_finish(struct gm_app_slot *app,int result) {
+  app->result=result;
+  gm_resource_reclaim(app);
+  app->state=GM_APP_FREE;
+  gm_program_kernel();
+  gm_program_result(app);
+}
+
+int gm_program_schedule(void) {
+  struct gm_app_slot *app;
+  uint32_t i;
+  uint32_t slot;
+
+  for (i=0;i<GM_APP_MAX;i++) {
+    slot=(gm_program_next+i)%GM_APP_MAX;
+    app=&gm_apps[slot];
+    if (app->state!=GM_APP_READY) continue;
+    gm_program_next=(slot+1U)%GM_APP_MAX;
+    gm_program_activate(app);
+    app->state=GM_APP_RUNNING;
+    gm_program_resume_user(&app->context);
+    return 1;
+  }
+  return 0;
+}
+
+static int gm_program_yield(struct gm_service_frame *frame) {
+  struct gm_app_slot *app;
+
+  app=gm_program_current;
+  gm_memcpy(&app->context,frame,sizeof(app->context));
+  app->state=GM_APP_READY;
+  gm_program_kernel();
   return 1;
 }
 
@@ -237,14 +615,14 @@ int gm_program_service(void *raw) {
   int ok;
 
   frame=(struct gm_service_frame *)raw;
-  if (!gm_program_running || (frame->cs&3U)!=3U) return 0;
-  if (gm_ticks()-gm_program_started>=GM_PROGRAM_MAX_TICKS) {
-    gm_program_result=-200;
+  if (gm_program_current->state!=GM_APP_RUNNING || (frame->cs&3U)!=3U) return 0;
+  if (gm_program_current->runtime_ticks>=GM_PROGRAM_MAX_TICKS) {
     gm_write("program timeout\n");
+    gm_program_finish(gm_program_current,-200);
     return 1;
   }
   if (frame->rax==GM_SVC_EXIT) {
-    gm_program_result=(int)(int32_t)frame->rdi;
+    gm_program_finish(gm_program_current,(int)(int32_t)frame->rdi);
     return 1;
   }
   if (frame->rax==GM_SVC_WRITE) {
@@ -253,16 +631,16 @@ int gm_program_service(void *raw) {
       gm_write((const char *)frame->rdi);
       frame->rax=1;
     }
-    return 0;
+    return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_PRINT_U64) {
     gm_print_u64(frame->rdi);
     frame->rax=1;
-    return 0;
+    return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_TICKS) {
     frame->rax=gm_ticks();
-    return 0;
+    return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_GATEWAY) {
     if (!gm_user_range(frame->rdi,4)) frame->rax=0;
@@ -271,17 +649,48 @@ int gm_program_service(void *raw) {
       gm_memcpy((void *)frame->rdi,gateway,4);
       frame->rax=1;
     }
-    return 0;
+    return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_PING) {
     if (!gm_user_range(frame->rdi,4)) frame->rax=0;
     else frame->rax=gm_ping((const uint8_t *)frame->rdi,frame->rsi>500U?500U:frame->rsi);
-    return 0;
+    return gm_program_yield(frame);
   }
-  if (frame->rax==GM_SVC_STORE_READ) {
+  if (frame->rax==GM_SVC_RESOURCE_ACQUIRE) {
+    if (gm_resource_acquire_service(gm_program_current,(uint32_t)frame->rdi,frame)) return 1;
+    return gm_program_yield(frame);
+  }
+  if (frame->rax==GM_SVC_RESOURCE_RELEASE) {
+    frame->rax=gm_resource_release_app(gm_program_current,(uint32_t)frame->rdi);
+    return gm_program_yield(frame);
+  }
+  if (frame->rax==GM_SVC_STORE_STAT) {
+    if (!gm_resource_owned(gm_program_current,GM_RESOURCE_TCP)) {
+      frame->rax=0;
+      return gm_program_yield(frame);
+    }
+    if (!gm_user_string(frame->rdi,191U,0) || !gm_user_range(frame->rsi,sizeof(uint64_t))) {
+      frame->rax=0;
+      return gm_program_yield(frame);
+    }
     if (!gm_tcp_connected() && !gm_store_connect()) {
       frame->rax=0;
-      return 0;
+      return gm_program_yield(frame);
+    }
+    len=0;
+    ok=gm_store_size((const char *)frame->rdi,&len);
+    if (ok) gm_memcpy((void *)frame->rsi,&len,sizeof(len));
+    frame->rax=ok;
+    return gm_program_yield(frame);
+  }
+  if (frame->rax==GM_SVC_STORE_READ) {
+    if (!gm_resource_owned(gm_program_current,GM_RESOURCE_TCP)) {
+      frame->rax=0;
+      return gm_program_yield(frame);
+    }
+    if (!gm_tcp_connected() && !gm_store_connect()) {
+      frame->rax=0;
+      return gm_program_yield(frame);
     }
     if (!gm_user_string(frame->rdi,191U,0) || frame->rcx>GM_STORE_BLOCK ||
         !gm_user_range(frame->rdx,frame->rcx)) frame->rax=0;
@@ -291,38 +700,66 @@ int gm_program_service(void *raw) {
       ok=gm_store_read((const char *)frame->rdi,frame->rsi,(uint8_t *)frame->rdx,size,&got);
       frame->rax=ok?got:0;
     }
-    return 0;
+    return gm_program_yield(frame);
   }
   if (frame->rax==GM_SVC_STORE_WRITE || frame->rax==GM_SVC_STORE_APPEND) {
+    if (!gm_resource_owned(gm_program_current,GM_RESOURCE_TCP)) {
+      frame->rax=0;
+      return gm_program_yield(frame);
+    }
     if (!gm_tcp_connected() && !gm_store_connect()) {
       frame->rax=0;
-      return 0;
+      return gm_program_yield(frame);
     }
     if (!gm_user_string(frame->rdi,191U,0) || frame->rdx>GM_STORE_BLOCK ||
         !gm_user_range(frame->rsi,frame->rdx)) frame->rax=0;
     else frame->rax=gm_store_write((const char *)frame->rdi,(const uint8_t *)frame->rsi,
                                    (uint16_t)frame->rdx,frame->rax==GM_SVC_STORE_APPEND);
-    return 0;
+    return gm_program_yield(frame);
   }
   frame->rax=0;
-  return 0;
+  return gm_program_yield(frame);
 }
 
 int gm_program_fault(uint64_t vector,uint64_t code,uint64_t cs) {
-  if (!gm_program_running || (cs&3U)!=3U) return 0;
-  gm_program_result=-100-(int)vector;
+  struct gm_app_slot *app;
+  int result;
+
+  app=gm_program_current;
+  if (app->state!=GM_APP_RUNNING || (cs&3U)!=3U) return 0;
+  result=-100-(int)vector;
+  gm_program_kernel();
   gm_write("program fault vector=");
   gm_print_u64(vector);
   gm_write(" code=");
   gm_print_hex(code);
   gm_write("\n");
+  app->result=result;
+  gm_resource_reclaim(app);
+  app->state=GM_APP_FREE;
+  gm_program_result(app);
   return 1;
 }
 
-int gm_program_tick(uint64_t cs) {
-  if (!gm_program_running || (cs&3U)!=3U) return 0;
-  if (gm_ticks()-gm_program_started<GM_PROGRAM_MAX_TICKS) return 0;
-  gm_program_result=-200;
-  gm_write("program timeout\n");
+int gm_program_preempt(void *raw) {
+  struct gm_service_frame *frame;
+  struct gm_app_slot *app;
+
+  frame=(struct gm_service_frame *)raw;
+  app=gm_program_current;
+  if (app->state!=GM_APP_RUNNING || (frame->cs&3U)!=3U) return 0;
+  app->runtime_ticks++;
+  if (app->runtime_ticks>=GM_PROGRAM_MAX_TICKS) {
+    gm_program_kernel();
+    gm_write("program timeout\n");
+    app->result=-200;
+    gm_resource_reclaim(app);
+    app->state=GM_APP_FREE;
+    gm_program_result(app);
+    return 1;
+  }
+  gm_memcpy(&app->context,frame,sizeof(app->context));
+  app->state=GM_APP_READY;
+  gm_program_kernel();
   return 1;
 }

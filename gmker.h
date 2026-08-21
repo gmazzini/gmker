@@ -7,7 +7,7 @@
 #include "limine.h"
 #include "gmabi.h"
 
-#define GM_VERSION "2.0"
+#define GM_VERSION "3.0"
 #define GM_TICK_HZ 100U
 #define GM_PAGE_SIZE 4096ULL
 #define GM_NET_MTU 1500U
@@ -91,8 +91,11 @@ void gm_memory_init(struct limine_memmap_response *memmap,uint64_t hhdm);
 uint64_t gm_page_alloc(void);
 void *gm_phys(uint64_t phys);
 uint64_t gm_memory_free(void);
+uint64_t gm_address_space_current(void);
+uint64_t gm_address_space_create(void);
+void gm_address_space_switch(uint64_t cr3);
 int gm_map_page(uint64_t virt,uint64_t phys,uint64_t flags);
-int gm_map_user_page(uint64_t virt,uint64_t phys,uint64_t flags);
+int gm_map_user_page_in(uint64_t cr3,uint64_t virt,uint64_t phys,uint64_t flags);
 uint64_t gm_read_cr2(void);
 
 void gm_irq_init(void);
@@ -141,11 +144,14 @@ void gm_store_status(void);
 
 void gm_programs_init(void);
 void gm_programs_list(void);
+void gm_programs_status(void);
+void gm_resources_status(void);
 int gm_program_run(const char *name,const char *args);
-int gm_program_enter(uint64_t entry,uint64_t stack,uint64_t arg,uint64_t arg_len);
+void gm_program_resume_user(void *frame);
+int gm_program_schedule(void);
 int gm_program_service(void *frame);
 int gm_program_fault(uint64_t vector,uint64_t code,uint64_t cs);
-int gm_program_tick(uint64_t cs);
+int gm_program_preempt(void *frame);
 
 void gm_shell_init(void);
 void gm_shell_poll(void);

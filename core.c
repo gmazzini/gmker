@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.02
+// Gianluca Mazzini @2026- Version 2.03
 #include "gmker.h"
 
 #define GM_COM1 0x3f8
@@ -343,6 +343,13 @@ uint64_t gm_memory_free(void) {
   return gm_page_end-gm_page_next;
 }
 
+static uint64_t gm_read_cr3(void) {
+  uint64_t cr3;
+
+  __asm__ volatile("mov %%cr3,%0":"=r"(cr3));
+  return cr3;
+}
+
 static uint64_t *gm_table(uint64_t entry) {
   return (uint64_t *)gm_phys(entry&GM_ADDR_MASK);
 }
@@ -359,8 +366,7 @@ static uint64_t *gm_next_table(uint64_t *table,uint64_t index,uint64_t flags) {
   return gm_table(table[index]);
 }
 
-static int gm_map_page_flags(uint64_t virt,uint64_t phys,uint64_t flags) {
-  uint64_t cr3;
+static int gm_map_page_flags(uint64_t cr3,uint64_t virt,uint64_t phys,uint64_t flags) {
   uint64_t parent_flags;
   uint64_t *pml4;
   uint64_t *pdpt;
@@ -369,7 +375,6 @@ static int gm_map_page_flags(uint64_t virt,uint64_t phys,uint64_t flags) {
   uint64_t index;
 
   if ((virt&0xfffULL) || (phys&0xfffULL)) return 0;
-  __asm__ volatile("mov %%cr3,%0":"=r"(cr3));
   parent_flags=flags&GM_PTE_USER;
   pml4=gm_table(cr3);
   pdpt=gm_next_table(pml4,(virt>>39)&0x1ffULL,parent_flags);
@@ -378,16 +383,40 @@ static int gm_map_page_flags(uint64_t virt,uint64_t phys,uint64_t flags) {
   index=(virt>>12)&0x1ffULL;
   if (pt[index]&GM_PTE_PRESENT) return 0;
   pt[index]=(phys&GM_ADDR_MASK)|flags|GM_PTE_PRESENT;
-  __asm__ volatile("invlpg (%0)"::"r"(virt):"memory");
+  if ((gm_read_cr3()&GM_ADDR_MASK)==(cr3&GM_ADDR_MASK))
+    __asm__ volatile("invlpg (%0)"::"r"(virt):"memory");
   return 1;
 }
 
-int gm_map_page(uint64_t virt,uint64_t phys,uint64_t flags) {
-  return gm_map_page_flags(virt,phys,flags);
+uint64_t gm_address_space_current(void) {
+  return gm_read_cr3();
 }
 
-int gm_map_user_page(uint64_t virt,uint64_t phys,uint64_t flags) {
-  return gm_map_page_flags(virt,phys,flags|GM_PTE_USER);
+uint64_t gm_address_space_create(void) {
+  uint64_t source_cr3;
+  uint64_t phys;
+  uint64_t *source;
+  uint64_t *target;
+  uint64_t i;
+
+  source_cr3=gm_read_cr3();
+  phys=gm_page_alloc();
+  source=gm_table(source_cr3);
+  target=(uint64_t *)gm_phys(phys);
+  for (i=256ULL;i<512ULL;i++) target[i]=source[i]&~GM_PTE_USER;
+  return phys;
+}
+
+void gm_address_space_switch(uint64_t cr3) {
+  __asm__ volatile("mov %0,%%cr3"::"r"(cr3):"memory");
+}
+
+int gm_map_page(uint64_t virt,uint64_t phys,uint64_t flags) {
+  return gm_map_page_flags(gm_read_cr3(),virt,phys,flags);
+}
+
+int gm_map_user_page_in(uint64_t cr3,uint64_t virt,uint64_t phys,uint64_t flags) {
+  return gm_map_page_flags(cr3,virt,phys,flags|GM_PTE_USER);
 }
 
 uint64_t gm_read_cr2(void) {

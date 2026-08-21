@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.01
+// Gianluca Mazzini @2026- Version 2.03
 #include "gmker.h"
 
 struct gm_config gm_config;
@@ -144,7 +144,7 @@ void gm_pump(void) {
 
 void kernel_main(void) {
   gm_serial_init();
-  gm_write("\nGMKER 2.0\n");
+  gm_write("\nGMKER 3.0\n");
 
   if (!LIMINE_BASE_REVISION_SUPPORTED) gm_panic("unsupported Limine base revision");
   if (!gm_memmap_request.response) gm_panic("no memory map");
@@ -164,6 +164,6 @@ void kernel_main(void) {
     gm_net_poll();
     gm_tcp_poll();
     gm_shell_poll();
-    __asm__ volatile("hlt");
+    if (!gm_program_schedule()) __asm__ volatile("hlt");
   }
 }

@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.0
+// Gianluca Mazzini @2026- Version 2.2
 #ifndef GMPROG_H
 #define GMPROG_H
 
@@ -83,12 +83,24 @@ static inline uint16_t gm_store_read(const char *path,uint64_t offset,void *data
   return (uint16_t)gm_call4(GM_SVC_STORE_READ,(uint64_t)path,offset,(uint64_t)data,len);
 }
 
+static inline int gm_store_stat(const char *path,uint64_t *size) {
+  return (int)gm_call2(GM_SVC_STORE_STAT,(uint64_t)path,(uint64_t)size);
+}
+
 static inline int gm_store_write(const char *path,const void *data,uint16_t len) {
   return (int)gm_call3(GM_SVC_STORE_WRITE,(uint64_t)path,(uint64_t)data,len);
 }
 
 static inline int gm_store_append(const char *path,const void *data,uint16_t len) {
   return (int)gm_call3(GM_SVC_STORE_APPEND,(uint64_t)path,(uint64_t)data,len);
+}
+
+static inline int gm_resource_acquire(uint32_t resource) {
+  return (int)gm_call1(GM_SVC_RESOURCE_ACQUIRE,resource);
+}
+
+static inline int gm_resource_release(uint32_t resource) {
+  return (int)gm_call1(GM_SVC_RESOURCE_RELEASE,resource);
 }
 
 #endif

@@ -1,7 +1,7 @@
 #ifndef GMABI_H
 #define GMABI_H
 
-#define GM_API_VERSION 1U
+#define GM_API_VERSION 2U
 #define GM_ARCH_X86_64 1U
 #define GM_ARCH_AARCH64 2U
 #define GM_ARCH_RISCV64 3U
@@ -20,5 +20,10 @@
 #define GM_SVC_STORE_READ 6U
 #define GM_SVC_STORE_WRITE 7U
 #define GM_SVC_STORE_APPEND 8U
+#define GM_SVC_RESOURCE_ACQUIRE 9U
+#define GM_SVC_RESOURCE_RELEASE 10U
+#define GM_SVC_STORE_STAT 11U
+
+#define GM_RESOURCE_TCP 1U
 
 #endif

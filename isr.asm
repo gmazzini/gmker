@@ -19,13 +19,12 @@ global gm_isr_xm
 global gm_isr_timer
 global gm_isr_service
 global gm_gdt_load
-global gm_program_enter
+global gm_program_resume_user
 extern gm_fault_dispatch
 extern gm_timer_irq
-extern gm_program_tick
+extern gm_program_preempt
 extern gm_program_service
-extern gm_program_resume_rsp
-extern gm_program_result
+extern gm_program_current
 
 gm_gdt_load:
   lgdt [rdi]
@@ -45,7 +44,7 @@ gm_gdt_load:
   ltr ax
   ret
 
-gm_program_enter:
+gm_program_resume_user:
   pushfq
   push rbx
   push rbp
@@ -53,22 +52,30 @@ gm_program_enter:
   push r13
   push r14
   push r15
-  mov [rel gm_program_resume_rsp],rsp
-  push qword 0x1b
-  push rsi
-  pushfq
+  mov rax,[rel gm_program_current]
+  mov [rax],rsp
+  mov rsp,rdi
   pop rax
-  or rax,0x200
-  push rax
-  push qword 0x23
-  push rdi
-  mov rdi,rdx
-  mov rsi,rcx
+  pop rbx
+  pop rcx
+  pop rdx
+  pop rsi
+  pop rdi
+  pop rbp
+  pop r8
+  pop r9
+  pop r10
+  pop r11
+  pop r12
+  pop r13
+  pop r14
+  pop r15
   iretq
 
-gm_program_resume:
+gm_program_kernel_resume:
   cli
-  mov rsp,[rel gm_program_resume_rsp]
+  mov rax,[rel gm_program_current]
+  mov rsp,[rax]
   pop r15
   pop r14
   pop r13
@@ -76,7 +83,6 @@ gm_program_resume:
   pop rbp
   pop rbx
   popfq
-  mov eax,[rel gm_program_result]
   ret
 
 %macro FAULT_NOERR 2
@@ -86,7 +92,7 @@ gm_program_resume:
   xor esi,esi
   mov rdx,[rsp+8]
   call gm_fault_dispatch
-  jmp gm_program_resume
+  jmp gm_program_kernel_resume
 %endmacro
 
 %macro FAULT_ERR 2
@@ -96,7 +102,7 @@ gm_program_resume:
   mov rsi,[rsp]
   mov rdx,[rsp+16]
   call gm_fault_dispatch
-  jmp gm_program_resume
+  jmp gm_program_kernel_resume
 %endmacro
 
 FAULT_NOERR gm_isr_de,0
@@ -158,7 +164,7 @@ gm_isr_service:
   mov rdi,rsp
   call gm_program_service
   test eax,eax
-  jnz gm_program_resume
+  jnz gm_program_kernel_resume
   POP_REGS
   iretq
 
@@ -166,9 +172,9 @@ gm_isr_timer:
   cld
   PUSH_REGS
   call gm_timer_irq
-  mov rdi,[rsp+128]
-  call gm_program_tick
+  mov rdi,rsp
+  call gm_program_preempt
   test eax,eax
-  jnz gm_program_resume
+  jnz gm_program_kernel_resume
   POP_REGS
   iretq

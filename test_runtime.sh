@@ -31,7 +31,7 @@ cleanup() {
   if [ -n "$HOST_PID" ]; then kill "$HOST_PID" 2>/dev/null || true; fi
   exec 3>&- 2>/dev/null || true
   rm -f "$QEMU_FIFO" "$TEST_ISO" "$HOST_LOG" "$STORE_LOG" "$QEMU_LOG"
-  rm -f .test-limine.conf .test-good.c .test-df.c .test-ud.c .test-guard.c .test-timeout.c
+  rm -f .test-limine.conf .test-good.c .test-df.c .test-ud.c .test-guard.c .test-kernel.c .test-dual.c .test-resowner.c .test-reswait.c .test-resfault.c .test-restimeout.c .test-store-noowner.c .test-store-owner.c .test-store-waiter.c .test-store-stat.c .test-timeout.c
   rm -rf .test-iso-root "$HOST_ROOT" "$RUNTIME_ROOT" "$OUTSIDE"
 }
 trap cleanup EXIT INT TERM
@@ -200,6 +200,162 @@ int gm_main(const char *args,uint64_t arg_len) {
   return 1;
 }
 SRC
+cat > .test-kernel.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  volatile uint8_t *kernel;
+  volatile uint8_t value;
+  (void)args;
+  (void)arg_len;
+  kernel=(volatile uint8_t *)0xffffffff80000000ULL;
+  value=*kernel;
+  (void)value;
+  return 1;
+}
+SRC
+cat > .test-dual.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  uint64_t start;
+  int a;
+
+  a=arg_len==1ULL && args[0]=='A';
+  gm_write(a?"DUAL_A_START\n":"DUAL_B_START\n");
+  start=gm_ticks();
+  while (gm_ticks()-start<300ULL) {}
+  gm_write(a?"DUAL_A_END\n":"DUAL_B_END\n");
+  return 0;
+}
+SRC
+cat > .test-resowner.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  uint64_t start;
+  (void)args;
+  (void)arg_len;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 10;
+  if (gm_resource_acquire(GM_RESOURCE_TCP)) return 11;
+  gm_write("RES_OWNER_ACQUIRED\n");
+  start=gm_ticks();
+  for (;gm_ticks()-start<100ULL;) {}
+  gm_write("RES_OWNER_RELEASE\n");
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 12;
+  return 0;
+}
+SRC
+cat > .test-reswait.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  (void)args;
+  (void)arg_len;
+  gm_write("RES_WAITER_REQUEST\n");
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 20;
+  gm_write("RES_WAITER_ACQUIRED\n");
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 21;
+  return 0;
+}
+SRC
+cat > .test-resfault.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  (void)args;
+  (void)arg_len;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 30;
+  gm_write("RES_FAULT_ACQUIRED\n");
+  __asm__ volatile("ud2");
+  return 31;
+}
+SRC
+cat > .test-restimeout.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  (void)args;
+  (void)arg_len;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 40;
+  gm_write("RES_TIMEOUT_ACQUIRED\n");
+  for (;;) {}
+  return 41;
+}
+SRC
+cat > .test-store-noowner.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  static const char data[]="bad";
+  (void)args;
+  (void)arg_len;
+  if (gm_store_write("/noowner.txt",data,3U)) return 50;
+  gm_write("STORE_NOOWNER_REJECTED\n");
+  return 0;
+}
+SRC
+cat > .test-store-owner.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  static const char data[]="owner";
+  uint64_t start;
+  (void)args;
+  (void)arg_len;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 60;
+  gm_write("TCP_OWNER_ACQUIRED\n");
+  if (!gm_store_write("/tcp.txt",data,5U)) return 61;
+  gm_write("TCP_OWNER_WROTE\n");
+  start=gm_ticks();
+  for (;gm_ticks()-start<300ULL;) {}
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 62;
+  gm_write("TCP_OWNER_RELEASED\n");
+  return 0;
+}
+SRC
+cat > .test-store-waiter.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  char data[6];
+  uint16_t got;
+  (void)args;
+  (void)arg_len;
+  gm_write("TCP_WAITER_REQUEST\n");
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 70;
+  gm_write("TCP_WAITER_ACQUIRED\n");
+  got=gm_store_read("/tcp.txt",0ULL,data,5U);
+  if (got!=5U || data[0]!='o' || data[1]!='w' || data[2]!='n' || data[3]!='e' || data[4]!='r') return 71;
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 72;
+  gm_write("TCP_WAITER_READ_OK\n");
+  return 0;
+}
+SRC
+cat > .test-store-stat.c <<'SRC'
+// Gianluca Mazzini @2026- Version 1.0
+#include "gmprog.h"
+int gm_main(const char *args,uint64_t arg_len) {
+  static const char one[]="x";
+  uint64_t size;
+  (void)args;
+  (void)arg_len;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 80;
+  if (!gm_store_write("/empty.txt",one,0U)) return 81;
+  size=999ULL;
+  if (!gm_store_stat("/empty.txt",&size) || size!=0ULL) return 82;
+  gm_write("STAT_EMPTY_OK\n");
+  size=999ULL;
+  if (gm_store_stat("/missing-stat.txt",&size)) return 83;
+  gm_write("STAT_MISSING_OK\n");
+  if (!gm_store_write("/one.txt",one,1U)) return 84;
+  size=0ULL;
+  if (!gm_store_stat("/one.txt",&size) || size!=1ULL) return 85;
+  gm_write("STAT_ONE_OK\n");
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 86;
+  return 0;
+}
+SRC
 cat > .test-timeout.c <<'SRC'
 // Gianluca Mazzini @2026- Version 1.0
 #include "gmprog.h"
@@ -214,9 +370,23 @@ make -s gm SRC=.test-good.c OUT="$RUNTIME_ROOT/programs/x86_64/good.gm"
 make -s gm SRC=.test-df.c OUT="$RUNTIME_ROOT/programs/x86_64/df.gm"
 make -s gm SRC=.test-ud.c OUT="$RUNTIME_ROOT/programs/x86_64/ud.gm"
 make -s gm SRC=.test-guard.c OUT="$RUNTIME_ROOT/programs/x86_64/guard.gm"
+make -s gm SRC=.test-kernel.c OUT="$RUNTIME_ROOT/programs/x86_64/kernelmap.gm"
+make -s gm SRC=.test-dual.c OUT="$RUNTIME_ROOT/programs/x86_64/dual.gm"
+make -s gm SRC=.test-resowner.c OUT="$RUNTIME_ROOT/programs/x86_64/resowner.gm"
+make -s gm SRC=.test-reswait.c OUT="$RUNTIME_ROOT/programs/x86_64/reswait.gm"
+make -s gm SRC=.test-resfault.c OUT="$RUNTIME_ROOT/programs/x86_64/resfault.gm"
+make -s gm SRC=.test-restimeout.c OUT="$RUNTIME_ROOT/programs/x86_64/restimeout.gm"
+make -s gm SRC=.test-store-noowner.c OUT="$RUNTIME_ROOT/programs/x86_64/storenoowner.gm"
+make -s gm SRC=.test-store-owner.c OUT="$RUNTIME_ROOT/programs/x86_64/storeowner.gm"
+make -s gm SRC=.test-store-waiter.c OUT="$RUNTIME_ROOT/programs/x86_64/storewaiter.gm"
+make -s gm SRC=.test-store-stat.c OUT="$RUNTIME_ROOT/programs/x86_64/storestat.gm"
 make -s gm SRC=.test-timeout.c OUT="$RUNTIME_ROOT/programs/x86_64/timeout.gm"
+make -s gm SRC=gmapps/diag.c OUT="$RUNTIME_ROOT/programs/x86_64/diag.gm"
+make -s gm SRC=gmapps/storecat.c OUT="$RUNTIME_ROOT/programs/x86_64/storecat.gm"
 cp "$RUNTIME_ROOT/programs/x86_64/good.gm" "$RUNTIME_ROOT/programs/x86_64/badimage.gm"
 printf '\001' | dd of="$RUNTIME_ROOT/programs/x86_64/badimage.gm" bs=1 seek=24 conv=notrunc status=none
+cp "$RUNTIME_ROOT/programs/x86_64/good.gm" "$RUNTIME_ROOT/programs/x86_64/api1.gm"
+printf '\001\000\000\000' | dd of="$RUNTIME_ROOT/programs/x86_64/api1.gm" bs=1 seek=4 conv=notrunc status=none
 
 echo '--- build isolated runtime ISO ---'
 cat > .test-limine.conf <<EOF_CONF
@@ -251,13 +421,17 @@ wait_new 'type help' 50 || fail "boot prompt"
 send_wait 'net' 'net state=up' 20
 send_wait 'ping 10.0.2.2' 'ok' 40
 send_wait 'store connect' 'error' 50
-send_wait 'version' 'gmker 2.0' 20
+send_wait 'version' 'gmker 3.0' 20
 
 start_store
 send_wait 'store connect' 'ok' 50
 send_wait 'store ping' 'ok' 30
 send_wait 'store write /persist.txt persist-ok' 'ok' 30
 send_wait 'store cat /persist.txt' 'persist-ok' 30
+
+send_wait 'apps' 'app 0 free ticks=0 owns=- waits=-' 20
+new_has 'app 3 free ticks=0 owns=- waits=-' || fail "apps idle slots"
+send_wait 'resources' 'tcp owner=free held=0 waiters=0 acquisitions=0 total=0 max=0 recent10m=0 ticks' 20
 
 send_wait 'run good' 'returned 7' 40
 new_has 'RUNTIME_GOOD' || fail "good program output"
@@ -267,14 +441,107 @@ send_wait 'run ud' 'returned -106' 40
 new_has 'program fault vector=6' || fail "invalid opcode fault"
 send_wait 'run guard' 'returned -114' 40
 new_has 'program fault vector=14' || fail "guard page fault"
+send_wait 'run kernelmap' 'returned -114' 40
+new_has 'program fault vector=14' || fail "kernel mapping user isolation"
 send_wait 'run badimage' 'program load error' 40
-send_wait 'version' 'gmker 2.0' 20
-send_wait 'run timeout' 'returned -200' 130
-new_has 'program timeout' || fail "program timeout marker"
+send_wait 'run api1' 'program load error' 40
+send_wait 'version' 'gmker 3.0' 20
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run dual A\nrun dual B\n' >&3
+wait_new 'started slot 0 /programs/x86_64/dual.gm' 40 || fail "dual slot 0 start"
+wait_new 'started slot 1 /programs/x86_64/dual.gm' 40 || fail "dual slot 1 start"
+send_wait 'version' 'gmker 3.0' 20
+send_wait 'ping 10.0.2.2' 'ok' 40
+wait_new 'DUAL_A_END' 80 || fail "round-robin app A"
+wait_new 'DUAL_B_END' 80 || fail "round-robin app B"
+grep -Fq 'app 0 returned 0' "$QEMU_LOG" || fail "round-robin app A return"
+grep -Fq 'app 1 returned 0' "$QEMU_LOG" || fail "round-robin app B return"
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run resowner
+run reswait
+' >&3
+wait_new 'RES_OWNER_ACQUIRED' 40 || fail "resource owner acquire"
+wait_new 'RES_WAITER_REQUEST' 40 || fail "resource waiter request"
+wait_new 'RES_OWNER_RELEASE' 130 || fail "resource owner release"
+wait_new 'RES_WAITER_ACQUIRED' 40 || fail "resource waiter wake"
+wait_new 'app 0 returned 0' 40 || fail "resource owner result"
+wait_new 'app 1 returned 0' 40 || fail "resource waiter result"
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run resfault
+run reswait
+' >&3
+wait_new 'RES_FAULT_ACQUIRED' 40 || fail "resource fault owner acquire"
+wait_new 'program fault vector=6' 40 || fail "resource owner fault"
+wait_new 'RES_WAITER_ACQUIRED' 40 || fail "resource release after fault"
+wait_new 'app 1 returned 0' 40 || fail "resource waiter after fault result"
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run restimeout
+run reswait
+' >&3
+wait_new 'RES_TIMEOUT_ACQUIRED' 40 || fail "resource timeout owner acquire"
+send_wait 'version' 'gmker 3.0' 20
+wait_new 'program timeout' 140 || fail "resource owner timeout"
+wait_new 'RES_WAITER_ACQUIRED' 40 || fail "resource release after timeout"
+wait_new 'app 1 returned 0' 40 || fail "resource waiter after timeout result"
+
+send_wait 'run diag hello' 'all tests passed' 80
+new_has 'tcp acquire: ok' || fail "diag TCP acquire"
+new_has 'tcp release: ok' || fail "diag TCP release"
+wait_new 'app 0 returned 0' 40 || fail "diag result"
+
+send_wait 'run storecat /diag.txt' 'diag-ok' 60
+wait_new 'app 0 returned 0' 40 || fail "storecat result"
+
+send_wait 'run storenoowner' 'STORE_NOOWNER_REJECTED' 40
+new_has 'app 0 returned 0' || fail "store without TCP ownership result"
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run storeowner\nrun storewaiter\n' >&3
+wait_new 'TCP_OWNER_ACQUIRED' 40 || fail "TCP application owner acquire"
+wait_new 'TCP_WAITER_REQUEST' 40 || fail "TCP application waiter request"
+wait_new 'TCP_OWNER_WROTE' 60 || fail "TCP owner GMSTORE write"
+send_wait 'apps' 'app 0 ready' 20
+new_has 'owns=tcp waits=-' || fail "apps TCP owner"
+new_has 'app 1 blocked' || fail "apps TCP waiter blocked"
+new_has 'owns=- waits=tcp' || fail "apps TCP waiter resource"
+send_wait 'resources' 'tcp owner=app0' 20
+new_has 'waiters=1' || fail "resources TCP waiter count"
+new_has 'acquisitions=' || fail "resources acquisition accounting"
+new_has 'recent10m=' || fail "resources recent accounting"
+send_wait 'store ping' 'ok' 40
+wait_new 'TCP_OWNER_RELEASED' 330 || fail "TCP owner release"
+wait_new 'TCP_WAITER_ACQUIRED' 40 || fail "TCP waiter wake"
+wait_new 'TCP_WAITER_READ_OK' 60 || fail "TCP waiter GMSTORE read"
+wait_new 'app 0 returned 0' 40 || fail "TCP owner result"
+wait_new 'app 1 returned 0' 40 || fail "TCP waiter result"
+send_wait 'resources' 'tcp owner=free held=0 waiters=0' 20
+new_has 'total=' || fail "resources completed total accounting"
+new_has 'max=' || fail "resources completed max accounting"
+new_has 'recent10m=' || fail "resources completed recent accounting"
+send_wait 'apps' 'app 0 free' 20
+new_has 'app 1 free' || fail "apps slots free after TCP contention"
+
+send_wait 'run storestat' 'STAT_EMPTY_OK' 60
+wait_new 'STAT_MISSING_OK' 40 || fail "STORE_STAT missing distinction"
+wait_new 'STAT_ONE_OK' 40 || fail "STORE_STAT non-zero size"
+wait_new 'app 0 returned 0' 40 || fail "STORE_STAT result"
+
+LOG_POS=$(wc -c < "$QEMU_LOG")
+printf 'run timeout\nrun timeout\n' >&3
+wait_new 'started slot 0 /programs/x86_64/timeout.gm' 40 || fail "CPU-bound slot 0 start"
+wait_new 'started slot 1 /programs/x86_64/timeout.gm' 40 || fail "CPU-bound slot 1 start"
+send_wait 'version' 'gmker 3.0' 20
+send_wait 'ping 10.0.2.2' 'ok' 40
+wait_new 'app 0 returned -200' 260 || fail "CPU-bound slot 0 timeout"
+wait_new 'app 1 returned -200' 260 || fail "CPU-bound slot 1 timeout"
 
 stop_store
 send_wait 'store ping' 'error' 50
-send_wait 'version' 'gmker 2.0' 20
+send_wait 'version' 'gmker 3.0' 20
 start_store
 send_wait 'store connect' 'ok' 50
 send_wait 'store cat /persist.txt' 'persist-ok' 30
@@ -290,4 +557,4 @@ QEMU_PID=
 stop_store
 
 echo 'QEMU runtime/recovery: OK'
-echo '===== OK GMKER 2.0 CONSOLIDATION TEST ====='
+echo '===== OK GMKER 3.0 CONSOLIDATION TEST ====='

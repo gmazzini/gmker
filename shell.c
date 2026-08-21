@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 2.01
+// Gianluca Mazzini @2026- Version 2.02
 #include "gmker.h"
 
 #define GM_LINE_MAX 512
@@ -42,6 +42,8 @@ static void gm_help(void) {
   gm_write("ping IP              ICMP echo\n");
   gm_write("tcp                  TCP client status\n");
   gm_write("programs             GMSTORE gm programs\n");
+  gm_write("apps                 application slots\n");
+  gm_write("resources            resource ownership/accounting\n");
   gm_write("run NAME [ARGS]      load and run GMSTORE program\n");
   gm_write("store status         GMSTORE status\n");
   gm_write("store connect        connect GMSTORE\n");
@@ -131,6 +133,8 @@ static void gm_command(char *line) {
   else if (gm_streq(cmd,"tcp")) gm_tcp_status();
   else if (gm_streq(cmd,"store")) gm_store_command(args);
   else if (gm_streq(cmd,"programs")) gm_programs_list();
+  else if (gm_streq(cmd,"apps")) gm_programs_status();
+  else if (gm_streq(cmd,"resources")) gm_resources_status();
   else if (gm_streq(cmd,"run")) {
     value=gm_word(&args);
     if (!value) gm_write("usage: run NAME [ARGS]\n");

@@ -1,8 +1,8 @@
-# gmker 2.0
+# gmker 3.0
 
 gmker is a small x86_64 operating environment designed to remain understandable as a whole.
 
-Its target is not Unix compatibility. Its target is a compact, deterministic machine with one execution flow, explicit resource bounds, native networking, remote persistent data and small gmker-native programs.
+Its target is not Unix compatibility. Its target is a compact, deterministic machine with one kernel control flow, explicit resource bounds, native networking, remote persistent data and a small bounded set of isolated gmker-native programs.
 
 A mechanism belongs in gmker only when a concrete gmker use case requires it.
 
@@ -10,14 +10,14 @@ A mechanism belongs in gmker only when a concrete gmker use case requires it.
 
 gmker chooses:
 
-- one execution flow;
-- explicit event pumping instead of a general scheduler;
+- one kernel control flow with bounded preemptive application time-multiplexing;
+- one fixed round-robin scheduler for at most four isolated applications, with explicit kernel event pumping between quanta;
 - bounded static state;
 - monotonic physical page allocation;
 - a narrow and explicit hardware target;
 - client-native networking;
 - GMSTORE as persistent named data and program source;
-- one loadable gm program at a time;
+- at most four isolated loadable gm programs at a time;
 - hardware isolation for loadable programs;
 - a flat source tree containing one current implementation.
 
@@ -25,20 +25,21 @@ These are architectural choices, not reduced versions of Linux facilities.
 
 ## Execution model
 
-After initialization gmker runs one loop:
+After initialization gmker runs one kernel loop:
 
 ```text
 network RX
 TCP timers
 serial shell
-HLT
+next READY application
+HLT when no application is runnable
 ```
 
-The PIT runs at 100 Hz. Timer interrupts advance the monotonic tick counter and wake the CPU from `hlt`.
+The PIT runs at 100 Hz. Timer interrupts advance the monotonic tick counter and provide the preemption boundary for ring-3 applications. Kernel execution itself is not scheduled as an application and always regains control between application quanta.
 
-There are no kernel threads, process table or general scheduler. Operations that wait for network progress explicitly pump the same event loop.
+There are no kernel threads or Unix-style process scheduler. Up to four statically bounded application slots are scheduled round-robin with no priorities or dynamic policy. A timer interrupt from ring 3 saves the complete user register/iret frame, marks the application READY and returns to the kernel loop. Every application service call is also a scheduling point: the service result is saved in that application's context before control returns to the kernel. This prevents syscall-heavy applications from avoiding preemption.
 
-At every point there is one active control path.
+At every instant there remains one active CPU control path; concurrency is time multiplexing between isolated application contexts under kernel control.
 
 ## Reliability model
 
@@ -101,7 +102,13 @@ The arena occupies one fixed user virtual range beginning at:
 0x0000000040000000
 ```
 
-Only that range is mapped user-accessible by gmker.
+The x86_64 arena spans 88 KiB of virtual address space: 64 KiB image, 4 KiB arguments, 4 KiB unmapped guard and 16 KiB stack. Twenty-one pages (84 KiB) are physically backed per application slot.
+
+gmker now reserves four bounded application slots, each with its own x86_64 CR3 and its own physical backing for the same GM01 virtual layout beginning at `0x40000000`. The upper half of each application address space reuses the kernel/HHDM/MMIO mappings with supervisor permission only; the lower half is constructed independently for that slot. A boot-time isolation check writes different values to the same user virtual address in two slots and verifies that the values remain distinct. Runtime regression also verifies that ring 3 cannot read the high-half kernel mapping.
+
+The scheduler is now multi-app and preemptive. The four private address spaces are persistent slot-owned arenas, and READY applications are selected by fixed round-robin order. A pure CPU loop cannot prevent the kernel loop, serial shell or network maintenance from running.
+
+Only the application arena is mapped user-accessible by gmker.
 
 ## Privilege model
 
@@ -109,17 +116,36 @@ gmker itself executes in ring 0.
 
 A loadable gm program executes in ring 3 using one TSS kernel stack and one `int 0x80` service gate. This isolation exists only to protect gmker from faulty program code; it is not a Unix process model.
 
+Application runtime state is held in four fixed application-slot structures. Each slot owns its CR3, arena, saved user context, state and execution accounting. The implemented states are FREE, READY, RUNNING and BLOCKED; BLOCKED is reserved for kernel-resource contention and becomes active with the resource manager.
+
 There is still:
 
-- one program at a time;
-- no PID;
+- no PID namespace;
 - no fork;
-- no multitasking between programs;
+- no shared writable memory between applications;
 - no users or permissions model;
 - no syscall compatibility layer;
-- no per-process scheduler.
+- no priorities or dynamic scheduling policy.
 
-When a program returns, faults or times out, gmker restores the shell execution path directly.
+When an application returns, faults or times out, only that slot terminates. The kernel and other READY applications continue.
+
+## Exclusive resource ownership
+
+gmker has a fixed kernel resource manager for application-facing resources that cannot be used concurrently. The first named exclusive resource is `GM_RESOURCE_TCP`. Resource ownership is distinct from kernel control: the kernel always retains transport maintenance and control-plane use, including timers, RX, retransmission, loader operations and serial-shell GMSTORE commands, even while an application owns application-facing TCP use. Ownership is therefore exclusive between applications, not a lock against the kernel itself.
+
+Applications use two ABI services through `gm_resource_acquire()` and `gm_resource_release()`. An acquire on a free resource assigns ownership immediately. An acquire on a busy resource saves the caller context, moves that slot to BLOCKED and enqueues it in a fixed FIFO of at most four application slots; there is no busy waiting. Release transfers ownership directly to the oldest waiter and changes that slot to READY.
+
+Application GMSTORE services (`STORE_READ`, `STORE_WRITE` and `STORE_APPEND`) require the caller to own `GM_RESOURCE_TCP`. A call without ownership fails without touching the transport. Ownership remains with the application across service calls until explicit release, allowing a short related transaction sequence to remain exclusive. The intended programming discipline is acquire immediately before the related TCP/GMSTORE work and release immediately afterward. Kernel GMSTORE operations do not consume or steal the application owner.
+
+An application may own at most one exclusive resource at a time. A second acquire while it already owns or waits for a resource fails. This deliberately prevents circular application lock dependency instead of providing general mutex/semaphore primitives. Applications are expected to acquire as late as practical, use the resource for the shortest interval and release immediately.
+
+All implemented application termination paths reclaim ownership automatically: normal return/exit, recoverable fault and execution timeout. If an administrative abort operation is later added, it must use the same reclaim path rather than stealing a resource independently.
+
+Each exclusive resource maintains bounded accounting: current owner and acquisition tick, FIFO waiters, acquisition count, completed total holding ticks, longest completed hold and 60 rolling ten-second buckets covering the most recent ten minutes. The `resources` shell command combines completed accounting with a current live hold, so `held`, `total`, `max` and `recent10m` remain meaningful while the resource is still owned. No accounting structure grows dynamically.
+
+The `apps` shell command shows all four slots with state, observed ring-3 CPU timer ticks, owned resource and awaited resource. The tick field is application CPU execution accounting, not wall-clock age. The `resources` command shows the TCP owner, current hold, waiter count, acquisition count, total holding ticks since boot, longest hold and rolling ten-minute usage.
+
+No administrative `abort` command is implemented. This is deliberate: an application cannot retain a resource indefinitely under the current model because every slot has a bounded execution deadline and timeout already follows the normal automatic resource-reclaim path. A separate abort mechanism would duplicate recovery behavior without a demonstrated need.
 
 
 ## Architecture model
@@ -296,32 +322,25 @@ All application programs come from GMSTORE.
 
 There is no second built-in application model.
 
-A typical execution is:
+A typical launch is:
 
 ```text
 > run random
+started slot 0 /programs/x86_64/random.gm
+>
 
-/programs/x86_64/random.gm
-        |
-        v
-STAT + READ from GMSTORE
-        |
-        v
-validate GM01
-        |
-        v
-copy to program arena
-        |
-        v
-ring 3 execution
-        |
-        +--> gm services
-        |
-        +--> return / fault / timeout
-        |
-        v
-shell
+GMSTORE load -> validate GM01 -> private slot arena -> READY
+                                              |
+                              kernel round-robin scheduler
+                                              |
+                                      ring 3 execution
+                                              |
+                         service / timer -> kernel loop
+                                              |
+                              return / fault / timeout
 ```
+
+`run` is asynchronous: after loading and preparing a free slot it returns immediately to the shell. Application output may therefore appear between shell output or output from other applications. Each individual kernel service is serialized, but separate service calls from different applications may interleave.
 
 `run random` resolves to `/programs/x86_64/random.gm`.
 
@@ -379,23 +398,30 @@ The whole program arena is cleared before loading a new image.
 
 Programs do not call kernel functions directly. They use the small service ABI exposed by `gmprog.h` through `int 0x80`.
 
-API version 1 contains:
+The current contract is GM API version 2:
 
 ```text
-0  exit
-1  write serial string
-2  print u64
-3  ticks
-4  gateway address
-5  ping
-6  GMSTORE read
-7  GMSTORE write
-8  GMSTORE append
+0   exit
+1   write serial string
+2   print u64
+3   ticks
+4   gateway address
+5   ping
+6   GMSTORE read
+7   GMSTORE write
+8   GMSTORE append
+9   exclusive resource acquire
+10  exclusive resource release
+11  GMSTORE stat
 ```
 
-Every pointer supplied by a program is range-checked before the kernel dereferences it.
+GM API version 2 is an intentional semantic break from version 1. Services 6-8 retain their numbers, but application GMSTORE access now requires explicit `GM_RESOURCE_TCP` ownership; executing an API-1 image with API-2 semantics would therefore be incorrect. The loader rejects API-1 GM01 images rather than carrying a compatibility path or two application execution models.
 
-GMSTORE read/write services accept at most one 1024-byte block per call. Programs can loop when they need larger objects.
+`STORE_STAT` was added because a real gmapp (`storecat`) needs to distinguish an empty object or EOF from read failure. It returns success separately and writes the 64-bit object size through a validated user pointer. `STORE_READ` keeps its compact byte-count-or-zero behavior and is not changed merely to make the interface more general.
+
+Every pointer supplied by a program is range-checked before the kernel dereferences it. GMSTORE read/write services accept at most one 1024-byte block per call; programs can loop when they need larger objects. Application GMSTORE services require TCP ownership, while kernel control-plane GMSTORE operations remain independent of application ownership.
+
+The ABI deliberately has no general IPC, shared-memory synchronization, mutex or semaphore service. Application isolation plus kernel resource ownership remains the complete inter-application coordination model.
 
 A program can therefore save persistent output directly, for example:
 
@@ -408,7 +434,12 @@ int gm_main(const char *args,uint64_t arg_len) {
 
   (void)args;
   (void)arg_len;
-  if (!gm_store_write(path,text,sizeof(text)-1U)) return 1;
+  if (!gm_resource_acquire(GM_RESOURCE_TCP)) return 1;
+  if (!gm_store_write(path,text,sizeof(text)-1U)) {
+    (void)gm_resource_release(GM_RESOURCE_TCP);
+    return 2;
+  }
+  if (!gm_resource_release(GM_RESOURCE_TCP)) return 3;
   return 0;
 }
 ```
@@ -466,8 +497,8 @@ The maintained application examples currently are:
 
 ```text
 gmapps/primes100.c   compute and print the first 100 prime numbers
-gmapps/diag.c        exercise the complete current application ABI
-gmapps/storecat.c    print a text object from GMSTORE
+gmapps/diag.c        exercise the complete current application ABI, including TCP ownership
+gmapps/storecat.c    acquire TCP, print a GMSTORE text object, then release TCP
 gmapps/netping.c     parse an IPv4 argument and ping it
 ```
 
@@ -494,6 +525,8 @@ arp
 ping IP
 tcp
 programs
+apps
+resources
 run NAME [ARGS]
 store status
 store connect
@@ -627,19 +660,41 @@ The test is bounded and self-cleaning. It validates:
 - GMSTORE unavailable while gmker remains responsive;
 - later GMSTORE connect and ping;
 - persistent GMSTORE write/read;
-- valid GM01 load and ring-3 execution;
+- valid GM01 API 2 load and ring-3 execution;
+- rejection of a deliberately downgraded GM01 API 1 image;
+- private-address-space isolation at the same application virtual address;
+- rejection of ring-3 access to the high-half kernel mapping;
 - service entry after a user program sets the x86 Direction Flag;
 - recoverable invalid-opcode fault;
 - recoverable guard-page page fault;
+- explicit TCP ownership for application GMSTORE services;
+- rejection of application GMSTORE access without TCP ownership;
+- FIFO TCP ownership contention between two applications;
+- automatic resource reclaim after application return, fault and timeout;
+- live `apps` state and `resources` ownership/accounting during and after contention;
+- `STORE_STAT` distinction for empty, missing and non-empty objects;
+- kernel GMSTORE control-plane use while TCP is application-owned;
 - rejection of a corrupted GM01 image;
 - ring-3 execution timeout and recovery;
+- simultaneous execution of two isolated applications under round-robin scheduling;
+- simultaneous pure CPU-bound applications preempted only by the timer;
+- serial shell and network responsiveness while applications are running;
 - GMSTORE loss while running, shell survival, reconnect and persistent-data recovery;
 - clean QEMU shutdown through `isa-debug-exit`.
 
 A successful run ends with:
 
 ```text
-===== OK GMKER 2.0 CONSOLIDATION TEST =====
+===== OK GMKER 3.0 CONSOLIDATION TEST =====
 ```
 
-This is the consolidation baseline for gmker 2.0 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.
+The final clean-build x86_64 kernel image reports:
+
+```text
+text   36492
+data     224
+bss    37008
+total  73724 bytes
+```
+
+This is the consolidation baseline for gmker 3.0 on the current x86_64 QEMU target. Additional architectures, physical NIC drivers, protocol features or execution models are future evolution rather than requirements for this baseline.
